@@ -123,6 +123,11 @@ Modules: `monitor` (protocol, memory, CPU control), `machine` (MEGA65 helpers),
 
 ## Protocol notes
 
+Addresses prefixed `777` read memory as the CPU currently sees it, banking
+included. A program that remaps memory during its loop (MAP, `$01`, VIC banks)
+can therefore show different bytes at the same `777xxxx` address from one read
+to the next; use the flat 28-bit address when you know where the code lives.
+
 The serial monitor is a line protocol: commands are echoed, output follows, and a
 `.` prompt ends it. `m65rs` frames every command with a random `#token` no-op so
 replies can't be confused with each other, and uses the binary `l` command for
