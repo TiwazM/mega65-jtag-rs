@@ -29,7 +29,7 @@ current banking, e.g. `777080d`):
 |---|---|
 | `info` | connection, registers, core version, model, ROM, BASIC mode |
 | `peek A` / `poke A B..` / `dump A [LEN]` / `fill S E V` | memory access |
-| `load FILE@ADDR` / `save S E FILE [--prg]` | binary in/out (ROM areas are unprotected via the Hypervisor) |
+| `load FILE@ADDR` / `save S E FILE [--prg] [--no-pause]` | binary in/out (ROM areas are unprotected via the Hypervisor); saves halt the CPU for a consistent snapshot unless `--no-pause` |
 | `prg FILE [--run] [--binary] [--jump ADDR] [--halt]` | load a PRG like LOAD would (fixes BASIC pointers), RUN it, or jump to it. Note that in C65 mode `$4000-$7FFF` is banked to ROM, so machine code there must be in C64 mode or below `$2000` |
 | `regs` / `stop` / `go [ADDR]` / `step [N] [--no-irq]` | CPU control and single stepping |
 | `break ADDR [--timeout S]` / `watch ADDR` / `break clear` | hardware PC breakpoint and memory-write watchpoint; waits and prints registers |
@@ -79,8 +79,10 @@ builds the same on macOS, Windows and Linux):
   follows PC, screen capture (optionally on every poll, save as PNG), a
   profiler (continuous PC sampling without stopping the CPU: hot-address table
   with click-to-disassemble, and a frame-rate graph from any byte that changes
-  once per rendered frame, with a Find… button that locates such bytes), a DMA
-  list decoder, and a console for raw monitor commands with the log. Addresses
+  once per rendered frame, with a Find… button that locates such bytes), a
+  watch list (named bytes/words that refresh on every poll, flash on change,
+  show a changes-per-second figure and can be edited in place), a DMA list
+  decoder, and a console for raw monitor commands with the log. Addresses
   typed anywhere may be symbol names, and disassembly shows labels.
 
 All hardware traffic runs on one worker thread, so the UI never blocks and

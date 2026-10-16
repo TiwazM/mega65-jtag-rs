@@ -35,7 +35,7 @@ pub enum Cmd {
     SavePng { path: PathBuf, pause: bool },
     LoadPrg { path: PathBuf, run: bool, binary: bool, jump: Option<u16> },
     LoadBinary { path: PathBuf, addr: u32 },
-    SaveMemory { path: PathBuf, start: u32, end: u32, prg: bool },
+    SaveMemory { path: PathBuf, start: u32, end: u32, prg: bool, pause: bool },
     TypeText { text: String, ret: bool, buffer: bool },
     Raw(String),
     Reset,
@@ -54,6 +54,8 @@ pub enum Cmd {
     Symbols(std::sync::Arc<mega65::symbols::SymbolTable>),
     /// Decode the DMA list at an address.
     DmaList { addr: u32 },
+    /// Addresses (and widths in bytes, 1 or 2) to read on every poll.
+    Watches(Vec<(u32, u8)>),
     Shutdown,
 }
 
@@ -77,6 +79,8 @@ pub enum Event {
     Progress(Option<(usize, usize)>),
     FrameFlagCandidates(Vec<mega65::probe::FlagCandidate>),
     DmaList { addr: u32, text: String },
+    /// Current watch values, in the order they were registered.
+    Watches(Vec<u32>),
 }
 
 pub struct Backend {
@@ -129,6 +133,7 @@ struct Worker {
     prof_hist: std::collections::HashMap<u32, u32>,
     prof_total: u32,
     symbols: std::sync::Arc<mega65::symbols::SymbolTable>,
+    watches: Vec<(u32, u8)>,
 }
 
 impl Worker {
@@ -152,6 +157,7 @@ impl Worker {
             prof_hist: Default::default(),
             prof_total: 0,
             symbols: Default::default(),
+            watches: Vec::new(),
         }
     }
 
@@ -315,8 +321,12 @@ impl Worker {
                 self.log(format!("loaded {} ({} bytes) at ${addr:07X}", path.display(), bytes.len()));
                 self.refresh_views()?;
             }
-            Cmd::SaveMemory { path, start, end, prg } => {
-                let data = self.mach()?.save_memory(start, end)?;
+            Cmd::SaveMemory { path, start, end, prg, pause } => {
+                if pause && end - start > 4096 {
+                    self.log(format!("halting the CPU for the {} KB save", (end - start) / 1024));
+                }
+                let m = self.mach()?;
+                let data = if pause { m.save_memory(start, end)? } else { m.mon.read_memory(start, (end - start) as usize)? };
                 let mut out = Vec::with_capacity(data.len() + 2);
                 if prg {
                     out.extend_from_slice(&(start as u16).to_le_bytes());
@@ -383,6 +393,11 @@ impl Worker {
                 self.symbols = t;
                 self.refresh_disasm()?;
             }
+            Cmd::Watches(w) => {
+                self.log(format!("watching {} address(es)", w.len()));
+                self.watches = w;
+                self.refresh_watches()?;
+            }
             Cmd::DmaList { addr } => {
                 let bytes = self.mach()?.mon.read_memory(addr, 512)?;
                 let text = mega65::dma::decode(&bytes, true).describe(addr);
@@ -440,6 +455,16 @@ impl Worker {
             self.last_regs = Some(r.clone());
             self.emit(Event::Registers { regs: r, stopped });
         }
+        if !self.watches.is_empty() {
+            let watches = self.watches.clone();
+            let m = self.mach()?;
+            let mut vals = Vec::with_capacity(watches.len());
+            for (a, w) in watches {
+                let lo = m.mon.peek_fast(a)? as u32;
+                vals.push(if w >= 2 { lo | (m.mon.peek_fast(a + 1)? as u32) << 8 } else { lo });
+            }
+            self.emit(Event::Watches(vals));
+        }
         let mut buckets: Vec<(u32, u32)> = self.prof_hist.iter().map(|(a, c)| (*a, *c)).collect();
         buckets.sort_by(|a, b| b.1.cmp(&a.1));
         buckets.truncate(64);
@@ -447,9 +472,25 @@ impl Worker {
         Ok(())
     }
 
+    fn refresh_watches(&mut self) -> mega65::Result<()> {
+        if self.watches.is_empty() {
+            return Ok(());
+        }
+        let watches = self.watches.clone();
+        let m = self.mach()?;
+        let mut vals = Vec::with_capacity(watches.len());
+        for (a, w) in watches {
+            let b = m.mon.read_memory(a, w.max(1) as usize)?;
+            vals.push(if w >= 2 { b[0] as u32 | (b[1] as u32) << 8 } else { b[0] as u32 });
+        }
+        self.emit(Event::Watches(vals));
+        Ok(())
+    }
+
     fn poll(&mut self) -> mega65::Result<()> {
         self.refresh_regs()?;
         self.refresh_views()?;
+        self.refresh_watches()?;
         if let Some((None, _)) = self.disasm {
             self.refresh_disasm()?;
         }
@@ -463,6 +504,7 @@ impl Worker {
         self.refresh_regs()?;
         self.refresh_views()?;
         self.refresh_disasm()?;
+        self.refresh_watches()?;
         Ok(())
     }
 

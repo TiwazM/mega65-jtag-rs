@@ -64,6 +64,9 @@ enum Cmd {
         /// Prefix a 2 byte PRG load address.
         #[arg(long)]
         prg: bool,
+        /// Read while the CPU keeps running (no consistent snapshot, but no freeze).
+        #[arg(long)]
+        no_pause: bool,
     },
     /// Load a PRG (and optionally RUN it) as a program would be LOADed.
     Prg {
@@ -331,6 +334,11 @@ fn load_symbols(cli: &Cli) -> anyhow::Result<mega65::symbols::SymbolTable> {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Die quietly when piped into `head` instead of panicking on EPIPE.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let cli = Cli::parse();
     let syms = load_symbols(&cli)?;
     match &cli.cmd {
@@ -428,9 +436,12 @@ fn run(cmd: Cmd, mut mach: Machine, syms: &mega65::symbols::SymbolTable) -> anyh
             mach.inject(a, &data)?;
             println!("loaded {} bytes at ${a:07X}", data.len());
         }
-        Cmd::Save { start, end, file, prg } => {
+        Cmd::Save { start, end, file, prg, no_pause } => {
             let (s, e) = (hx(&start)?, hx(&end)?);
-            let d = mach.save_memory(s, e)?;
+            if !no_pause && e - s > 4096 {
+                eprintln!("halting the CPU for the {} KB read (use --no-pause to read while running)", (e - s) / 1024);
+            }
+            let d = if no_pause { mach.mon.read_memory(s, (e - s) as usize)? } else { mach.save_memory(s, e)? };
             let mut f = std::fs::File::create(&file)?;
             if prg {
                 f.write_all(&(s as u16).to_le_bytes())?;

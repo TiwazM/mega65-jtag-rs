@@ -35,7 +35,8 @@ fn selftest(device: String) {
     for c in script {
         b.send(c);
     }
-    // Profiler for ~2.5 s, then stop and disconnect.
+    // Two watches, then the profiler for ~2.5 s, then stop and disconnect.
+    b.send(Cmd::Watches(vec![(0x74ba, 1), (0x74cb, 2)]));
     b.send(Cmd::Profiler { enabled: true, frame_flag: Some(0x74ba), bucket: 16 });
     std::thread::sleep(Duration::from_millis(2500));
     b.send(Cmd::Profiler { enabled: false, frame_flag: None, bucket: 16 });
@@ -51,6 +52,7 @@ fn selftest(device: String) {
                     Event::Memory { id, addr, data } => println!("Memory view {id} @{addr:X}: {:02X?}", &data[..8.min(data.len())]),
                     Event::Disasm { addr, text } => println!("Disasm @{addr:X}: {:?}", text.lines().next().unwrap_or("")),
                     Event::Registers { regs, stopped } => println!("Registers: {regs} stopped={stopped}"),
+                    Event::Watches(v) => println!("Watches: {v:X?}"),
                     Event::Profile { total, buckets, samples_per_sec, fps } => println!("Profile: {total} samples @{samples_per_sec:.0}/s fps={fps:?} top={:?}", buckets.iter().take(3).map(|(a, c)| format!("${a:04X}:{c}")).collect::<Vec<_>>()),
                     Event::Disconnected => {
                         println!("Disconnected");

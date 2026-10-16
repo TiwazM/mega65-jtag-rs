@@ -36,6 +36,16 @@ struct Settings {
     prof_bucket: u32,
     symbols_path: String,
     dma_addr: String,
+    watches: Vec<WatchDef>,
+    save_pause: bool,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct WatchDef {
+    expr: String,
+    name: String,
+    /// 1 or 2 bytes (little-endian word).
+    width: u8,
 }
 
 impl Default for Settings {
@@ -59,6 +69,8 @@ impl Default for Settings {
             prof_bucket: 16,
             symbols_path: String::new(),
             dma_addr: String::new(),
+            watches: Vec::new(),
+            save_pause: true,
         }
     }
 }
@@ -69,6 +81,7 @@ enum Tab {
     Disassembly,
     Screen,
     Profiler,
+    Watches,
     Dma,
     Console,
 }
@@ -116,6 +129,18 @@ pub struct StudioApp {
     flag_candidates: Vec<mega65::probe::FlagCandidate>,
     symbols: std::sync::Arc<mega65::symbols::SymbolTable>,
     dma_text: String,
+    watch_vals: Vec<WatchState>,
+    watch_new: (String, String, u8),
+    watch_edit: Option<(usize, String)>,
+}
+
+#[derive(Default, Clone)]
+struct WatchState {
+    addr: Option<u32>,
+    value: Option<u32>,
+    changed_at: Option<std::time::Instant>,
+    /// Timestamps of recent changes, for a changes/second figure.
+    changes: VecDeque<std::time::Instant>,
 }
 
 impl StudioApp {
@@ -159,7 +184,11 @@ impl StudioApp {
             flag_candidates: Vec::new(),
             symbols: Default::default(),
             dma_text: String::new(),
+            watch_vals: Vec::new(),
+            watch_new: (String::new(), String::new(), 1),
+            watch_edit: None,
         };
+        app.watch_vals = vec![WatchState::default(); app.s.watches.len()];
         if !app.s.symbols_path.is_empty() {
             app.load_symbols(std::path::PathBuf::from(app.s.symbols_path.clone()));
         }
@@ -173,6 +202,7 @@ impl StudioApp {
                 self.s.symbols_path = path.display().to_string();
                 self.symbols = std::sync::Arc::new(t);
                 self.backend.send(Cmd::Symbols(self.symbols.clone()));
+                self.send_watches();
             }
             Err(e) => self.last_error = Some(e.to_string()),
         }
@@ -221,6 +251,7 @@ impl StudioApp {
                     self.push_log(format!("connected: {}", self.status));
                     self.last_error = None;
                     self.send_views();
+                    self.send_watches();
                 }
                 Event::Disconnected => {
                     self.connected = false;
@@ -270,6 +301,21 @@ impl StudioApp {
                 }
                 Event::Progress(p) => self.progress = p,
                 Event::DmaList { addr, text } => self.dma_text = format!("DMA list at ${addr:07X}\n{text}"),
+                Event::Watches(vals) => {
+                    let now = std::time::Instant::now();
+                    for (i, v) in vals.into_iter().enumerate() {
+                        if let Some(w) = self.watch_vals.get_mut(i) {
+                            if w.value.map(|old| old != v).unwrap_or(false) {
+                                w.changed_at = Some(now);
+                                w.changes.push_back(now);
+                            }
+                            while w.changes.front().map(|t| now.duration_since(*t) > Duration::from_secs(5)).unwrap_or(false) {
+                                w.changes.pop_front();
+                            }
+                            w.value = Some(v);
+                        }
+                    }
+                }
                 Event::FrameFlagCandidates(v) => {
                     self.push_log(format!("frame flag scan: {} candidates", v.len()));
                     self.flag_candidates = v;
@@ -281,6 +327,18 @@ impl StudioApp {
                 }
             }
         }
+    }
+
+    fn send_watches(&mut self) {
+        let syms = self.symbols.clone();
+        let mut list = Vec::new();
+        self.watch_vals.resize(self.s.watches.len(), WatchState::default());
+        for (i, w) in self.s.watches.iter().enumerate() {
+            let a = syms.resolve(&w.expr).ok();
+            self.watch_vals[i].addr = a;
+            list.push((a.unwrap_or(0), w.width));
+        }
+        self.backend.send(Cmd::Watches(list));
     }
 
     fn send_views(&self) {
@@ -476,13 +534,14 @@ impl StudioApp {
             ui.add(egui::TextEdit::singleline(&mut self.save_start).desired_width(60.0).hint_text("start"));
             ui.add(egui::TextEdit::singleline(&mut self.save_end).desired_width(60.0).hint_text("end"));
             if ui.add_enabled(en, egui::Button::new("Save…")).on_hover_text("save a memory range as a PRG").clicked() {
-                if let (Ok(s), Ok(e)) = (parse_hex(&self.save_start), parse_hex(&self.save_end)) {
+                if let (Ok(s), Ok(e)) = (self.addr(&self.save_start), self.addr(&self.save_end)) {
                     if let Some(p) = rfd::FileDialog::new().set_file_name("memory.prg").save_file() {
-                        self.backend.send(Cmd::SaveMemory { path: p, start: s, end: e, prg: true });
+                        self.backend.send(Cmd::SaveMemory { path: p, start: s, end: e, prg: true, pause: self.s.save_pause });
                     }
                 }
             }
         });
+        ui.checkbox(&mut self.s.save_pause, "halt CPU while saving").on_hover_text("consistent snapshot, but the program (and its audio) freezes for the duration; off = read while running");
         ui.separator();
         ui.heading("Keyboard");
         ui.add(egui::TextEdit::singleline(&mut self.type_in).hint_text("text to type (~M = RETURN)"));
@@ -767,6 +826,120 @@ impl StudioApp {
         }
     }
 
+    fn watches_tab(&mut self, ui: &mut egui::Ui) {
+        let en = self.connected;
+        ui.horizontal(|ui| {
+            ui.label("Add:");
+            ui.add(egui::TextEdit::singleline(&mut self.watch_new.0).desired_width(110.0).hint_text("address or symbol"));
+            ui.add(egui::TextEdit::singleline(&mut self.watch_new.1).desired_width(110.0).hint_text("name (optional)"));
+            ui.selectable_value(&mut self.watch_new.2, 1u8, "byte");
+            ui.selectable_value(&mut self.watch_new.2, 2u8, "word");
+            if ui.add_enabled(!self.watch_new.0.is_empty(), egui::Button::new("Add")).clicked() {
+                let expr = self.watch_new.0.trim().to_string();
+                let name = if self.watch_new.1.trim().is_empty() { expr.clone() } else { self.watch_new.1.trim().to_string() };
+                self.s.watches.push(WatchDef { expr, name, width: self.watch_new.2 });
+                self.watch_new.0.clear();
+                self.watch_new.1.clear();
+                self.send_watches();
+            }
+            if let Some(r) = &self.regs {
+                let _ = r;
+            }
+            ui.label(RichText::new("values refresh on every live poll (and during profiling); click a value to change it").weak().small());
+        });
+        let now = std::time::Instant::now();
+        let mut remove: Option<usize> = None;
+        let mut write: Option<(u32, u8, u32)> = None;
+        let mut resend = false;
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            egui::Grid::new("watches").striped(true).spacing([14.0, 4.0]).show(ui, |ui| {
+                for h in ["name", "address", "hex", "dec", "bits", "changes/s", ""] {
+                    ui.label(RichText::new(h).weak());
+                }
+                ui.end_row();
+                for i in 0..self.s.watches.len() {
+                    let (name, expr, width) = {
+                        let w = &self.s.watches[i];
+                        (w.name.clone(), w.expr.clone(), w.width)
+                    };
+                    let st = self.watch_vals.get(i).cloned().unwrap_or_default();
+                    ui.label(RichText::new(&name).strong());
+                    match st.addr {
+                        Some(a) => {
+                            let lab = if expr.eq_ignore_ascii_case(&format!("{a:04X}")) || expr.eq_ignore_ascii_case(&format!("${a:04X}")) { String::new() } else { format!("  ({expr})") };
+                            ui.label(RichText::new(format!("${a:07X}{lab}")).monospace().weak());
+                        }
+                        None => {
+                            ui.label(RichText::new(format!("{expr}: unresolved")).color(Color32::from_rgb(230, 90, 90)));
+                        }
+                    }
+                    let flash = st.changed_at.map(|t| now.duration_since(t) < Duration::from_millis(800)).unwrap_or(false);
+                    let colour = if flash { Color32::from_rgb(255, 200, 80) } else { ui.visuals().text_color() };
+                    match st.value {
+                        Some(v) => {
+                            if let Some((ei, text)) = &mut self.watch_edit {
+                                if *ei == i {
+                                    let r = ui.add(egui::TextEdit::singleline(text).desired_width(50.0).font(egui::TextStyle::Monospace));
+                                    r.request_focus();
+                                    if ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
+                                        if let (Ok(nv), Some(a)) = (u32::from_str_radix(text.trim().trim_start_matches('$'), 16), st.addr) {
+                                            write = Some((a, width, nv));
+                                        }
+                                        self.watch_edit = None;
+                                    } else if ui.input(|inp| inp.key_pressed(egui::Key::Escape)) {
+                                        self.watch_edit = None;
+                                    }
+                                    ui.label("");
+                                    ui.label("");
+                                    ui.label("");
+                                    if ui.small_button("✕").clicked() {
+                                        remove = Some(i);
+                                    }
+                                    ui.end_row();
+                                    continue;
+                                }
+                            }
+                            let hex = if width == 2 { format!("${v:04X}") } else { format!("${v:02X}") };
+                            let r = ui.add(egui::Label::new(RichText::new(hex).monospace().color(colour).strong()).sense(egui::Sense::click()));
+                            if r.clicked() && en {
+                                self.watch_edit = Some((i, if width == 2 { format!("{v:04X}") } else { format!("{v:02X}") }));
+                            }
+                            ui.label(RichText::new(format!("{v}")).monospace().color(colour));
+                            ui.label(RichText::new(if width == 2 { format!("{:08b} {:08b}", v >> 8, v & 0xff) } else { format!("{v:08b}") }).monospace().color(colour).small());
+                            let per_s = st.changes.len() as f32 / 5.0;
+                            ui.label(RichText::new(if st.changes.is_empty() { "-".into() } else { format!("{per_s:.1}") }).monospace());
+                        }
+                        None => {
+                            ui.label(RichText::new("?").weak());
+                            ui.label("");
+                            ui.label("");
+                            ui.label("");
+                        }
+                    }
+                    if ui.small_button("✕").clicked() {
+                        remove = Some(i);
+                    }
+                    ui.end_row();
+                }
+            });
+        });
+        if let Some(i) = remove {
+            self.s.watches.remove(i);
+            self.watch_vals.remove(i.min(self.watch_vals.len().saturating_sub(1)));
+            resend = true;
+        }
+        if let Some((a, w, v)) = write {
+            let data = if w == 2 { vec![v as u8, (v >> 8) as u8] } else { vec![v as u8] };
+            self.backend.send(Cmd::WriteBytes { addr: a, data });
+        }
+        if resend {
+            self.send_watches();
+        }
+        if self.connected && !self.s.watches.is_empty() {
+            ui.ctx().request_repaint_after(Duration::from_millis(200));
+        }
+    }
+
     fn dma_tab(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label("DMA list at:");
@@ -843,6 +1016,7 @@ impl eframe::App for StudioApp {
                 ui.selectable_value(&mut self.s.tab, Tab::Disassembly, "Disassembly");
                 ui.selectable_value(&mut self.s.tab, Tab::Screen, "Screen");
                 ui.selectable_value(&mut self.s.tab, Tab::Profiler, if self.prof_on { "Profiler ●" } else { "Profiler" });
+                ui.selectable_value(&mut self.s.tab, Tab::Watches, if self.s.watches.is_empty() { "Watches".to_string() } else { format!("Watches ({})", self.s.watches.len()) });
                 ui.selectable_value(&mut self.s.tab, Tab::Dma, "DMA");
                 ui.selectable_value(&mut self.s.tab, Tab::Console, "Console / Log");
             });
@@ -852,6 +1026,7 @@ impl eframe::App for StudioApp {
                 Tab::Disassembly => self.disasm_tab(ui),
                 Tab::Screen => self.screen_tab(ui),
                 Tab::Profiler => self.profiler_tab(ui),
+                Tab::Watches => self.watches_tab(ui),
                 Tab::Dma => self.dma_tab(ui),
                 Tab::Console => self.console_tab(ui),
             }

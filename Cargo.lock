@@ -1813,6 +1813,7 @@ dependencies = [
  "chrono",
  "clap",
  "crossterm",
+ "libc",
  "png",
  "rand 0.8.8",
  "rusb",
