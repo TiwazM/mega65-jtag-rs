@@ -59,6 +59,33 @@ JTAG (`m65rs jtag ...`): `list`, `idcode`, `bitinfo FILE.bit`, and
 volatile: the cores in flash are never written, and the next power cycle brings
 the flashed core back. The bitstream's IDCODE is checked against the FPGA first.
 
+## GUI: MEGA65 Studio
+
+`cargo run --release -p m65-studio` opens a debugger-style window (egui, so it
+builds the same on macOS, Windows and Linux):
+
+- toolbar: device/baud, Connect, Stop / Go / Step N, Refresh, Reset, live polling interval;
+- sidebar: registers and flags, breakpoint, watchpoint, go-to, IRQ on/off, PRG
+  loader (Browse or drag a file onto the window), memory save, virtual keyboard,
+  GO64 / PAL / NTSC;
+- tabs: two live hex memory views (click a byte to edit it), disassembly that
+  follows PC, screen capture (optionally on every poll, save as PNG), and a
+  console for raw monitor commands with the log.
+
+All hardware traffic runs on one worker thread, so the UI never blocks and
+panels can't interleave commands. Settings persist between runs.
+`m65-studio --selftest DEVICE` exercises that worker without a window.
+
+### Xemu as a backend
+
+Start Xemu with its UART monitor (`xmega65 -uartmon /tmp/xemu-umon.sock` on
+macOS/Linux, `-uartmon :4510` on Windows) and connect to that socket or
+`tcp:localhost:4510`. Memory, registers, disassembly, screenshots, PRG loading
+and typing all work. Xemu's monitor has no `l` fast-load (writes go through `s`,
+so they're slower) and no `#` no-op, and the Xemu "next" builds from 2026 crash
+with SIGBUS when the CPU leaves trace mode, so `m65rs`/Studio refuse to resume
+after a halt or breakpoint on Xemu; restart Xemu instead.
+
 ## Library
 
 ```rust

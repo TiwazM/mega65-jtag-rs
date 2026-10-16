@@ -6,6 +6,9 @@ rust-version = "1.83"
 description = "Library and CLI for developing and debugging on the MEGA65 over its JTAG/serial-monitor interface"
 license = "GPL-3.0-or-later"
 
+[workspace]
+members = [".", "gui"]
+
 [lib]
 name = "mega65"
 path = "src/lib.rs"

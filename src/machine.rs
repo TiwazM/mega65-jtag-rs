@@ -318,13 +318,18 @@ impl Machine {
         }
         let _ = self.stuff_keybuffer(&format!("REM M65RS LOAD AT ${load_addr:04X}:\r"));
         std::thread::sleep(Duration::from_millis(20));
-        self.mon.stop_cpu()?;
+        let halt = !self.mon.xemu;
+        if halt {
+            self.mon.stop_cpu()?;
+        }
         self.mon.write_memory(load_addr as u32, &prg.data)?;
         if !honour_addr || load_addr == 0x0801 || load_addr == 0x2001 {
             let ptr = if self.mode == Mode::C65 { 0x82u32 } else { 0x2d };
             self.mon.set_bytes(ptr, &(end as u16).to_le_bytes())?;
         }
-        self.mon.start_cpu()?;
+        if halt {
+            self.mon.start_cpu()?;
+        }
         if run {
             std::thread::sleep(Duration::from_millis(50));
             self.stuff_keybuffer("RUN:\r")?;
@@ -363,15 +368,7 @@ impl Machine {
     /// Save a memory range to a file. With `basic` the current BASIC program is
     /// saved as a PRG (with load address header).
     pub fn save_memory(&mut self, start: u32, end: u32) -> Result<Vec<u8>> {
-        let was = self.mon.cpu_stopped;
-        if !was {
-            self.mon.stop_cpu()?;
-        }
-        let r = self.mon.read_memory(start, (end - start) as usize);
-        if !was {
-            self.mon.start_cpu()?;
-        }
-        r
+        self.mon.with_cpu_paused(|m| m.read_memory(start, (end - start) as usize))
     }
 
     /// Current BASIC program range (start, end) for the detected mode.
@@ -544,6 +541,7 @@ impl Machine {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct Versions {
     pub core: String,
     pub model_id: u8,

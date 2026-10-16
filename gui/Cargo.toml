@@ -1,0 +1,19 @@
+[package]
+name = "m65-studio"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.83"
+description = "MEGA65 development and debugging workstation (GUI) built on the mega65 crate"
+license = "GPL-3.0-or-later"
+
+[[bin]]
+name = "m65-studio"
+path = "src/main.rs"
+
+[dependencies]
+mega65 = { path = ".." }
+eframe = { version = "0.29", default-features = false, features = ["default_fonts", "glow", "persistence", "x11", "wayland"] }
+egui = "0.29"
+rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+png = "0.17"

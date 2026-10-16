@@ -62,6 +62,10 @@ pub struct Monitor {
     pub rx_buffered: bool,
     /// Our belief about whether the CPU is halted (`t1`).
     pub cpu_stopped: bool,
+    /// Talking to Xemu's emulated monitor (one command at a time, no `#`).
+    pub xemu: bool,
+    /// Pace single bytes (old bitstreams without an RX FIFO, serial only).
+    pace_writes: bool,
     pub debug: bool,
     /// Any unsolicited output (breakpoint/watch hits) seen while waiting for other things.
     pub events: Vec<String>,
@@ -69,7 +73,7 @@ pub struct Monitor {
 
 impl Monitor {
     pub fn new(t: Box<dyn Transport>) -> Self {
-        Self { t, rx: Vec::new(), rx_buffered: true, cpu_stopped: false, debug: false, events: Vec::new() }
+        Self { t, rx: Vec::new(), rx_buffered: true, cpu_stopped: false, xemu: false, pace_writes: false, debug: false, events: Vec::new() }
     }
 
     /// Open the transport and synchronise with the monitor.
@@ -94,7 +98,7 @@ impl Monitor {
         if self.debug {
             eprintln!(">> {:?}", String::from_utf8_lossy(data));
         }
-        if self.rx_buffered {
+        if !self.pace_writes {
             self.t.write_all(data)
         } else {
             for b in data {
@@ -183,7 +187,13 @@ impl Monitor {
             match self.read_until(token.as_bytes(), Duration::from_millis(1000)) {
                 Ok(_) => {
                     // Swallow the rest of the line and prompt.
-                    let _ = self.read_quiet(Duration::from_millis(3), Duration::from_millis(30));
+                    let rest = self.read_quiet(Duration::from_millis(3), Duration::from_millis(30)).unwrap_or_default();
+                    if find(&rest, b"not implemented").is_some() {
+                        // Xemu's monitor: no `#` command, and it only handles one
+                        // command per read, so we can't pipeline.
+                        self.xemu = true;
+                        self.rx_buffered = false;
+                    }
                     return Ok(());
                 }
                 Err(Error::Timeout(_)) => {
@@ -191,6 +201,7 @@ impl Monitor {
                     // so it completes, then retry. Also fall back to slow writes.
                     if attempt == 2 {
                         self.rx_buffered = false;
+                        self.pace_writes = true;
                     }
                     if attempt >= 3 {
                         let zeros = [0u8; 256];
@@ -214,6 +225,16 @@ impl Monitor {
 
     pub fn command_timeout(&mut self, cmd: &str, timeout: Duration) -> Result<String> {
         self.purge()?;
+        if !self.rx_buffered {
+            // One command at a time: send it and wait for the echo, then the prompt.
+            self.write_raw(format!("{cmd}\r").as_bytes())?;
+            let echo = if cmd.is_empty() { b"\r".to_vec() } else { cmd.as_bytes().to_vec() };
+            self.read_until(&echo, timeout)?;
+            let raw = self.read_until(b"\n.", timeout)?;
+            let _ = self.read_quiet(Duration::from_millis(2), Duration::from_millis(20));
+            let text = String::from_utf8_lossy(&raw[..raw.len() - 2]).replace('\r', "");
+            return Ok(text.trim_matches('\n').to_string());
+        }
         let token = format!("#{:08x}", rand::random::<u32>());
         // The token command after the real one marks the end of its output.
         self.write_raw(format!("{cmd}\r").as_bytes())?;
@@ -245,9 +266,30 @@ impl Monitor {
 
     /// Let the CPU run (`t0`). Also used to resume after a breakpoint.
     pub fn start_cpu(&mut self) -> Result<()> {
+        if self.xemu && self.cpu_stopped {
+            // Xemu (at least the 2026 "next" builds) crashes with SIGBUS when it
+            // leaves trace mode, so refuse rather than kill the emulator.
+            return Err(Error::Other(
+                "this Xemu build crashes when the CPU is resumed after a halt or breakpoint; restart Xemu instead".into(),
+            ));
+        }
         self.command("t0")?;
         self.cpu_stopped = false;
         Ok(())
+    }
+
+    /// Run `f` with the CPU halted, restoring the previous run state afterwards.
+    /// On Xemu (which can't resume) the CPU is left running.
+    pub fn with_cpu_paused<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        let was_stopped = self.cpu_stopped;
+        if !was_stopped && !self.xemu {
+            self.stop_cpu()?;
+        }
+        let r = f(self);
+        if !was_stopped && !self.xemu {
+            self.start_cpu()?;
+        }
+        r
     }
 
     /// Continuous trace mode (`tc`): the monitor prints every instruction.
@@ -257,6 +299,9 @@ impl Monitor {
 
     /// Execute one instruction (CPU must be stopped) and return the register dump.
     pub fn step(&mut self) -> Result<Registers> {
+        if self.xemu {
+            return Err(Error::Other("single-stepping crashes this Xemu build's monitor".into()));
+        }
         if !self.cpu_stopped {
             self.stop_cpu()?;
         }
@@ -435,10 +480,13 @@ impl Monitor {
         if data.is_empty() {
             return Ok(());
         }
-        if data.len() <= 8 {
+        if data.len() <= 8 || self.xemu {
+            // Xemu's monitor has no `l`; `s` with 16 bytes per line is what's left.
             return self.set_bytes(addr, data);
         }
-        let was_stopped = self.cpu_stopped;
+        // The real monitor can't keep up at 2 Mbit/s with the CPU running; Xemu
+        // doesn't care, and can't resume from a halt anyway.
+        let was_stopped = self.cpu_stopped || self.xemu;
         if !was_stopped {
             self.stop_cpu()?;
         }
@@ -454,6 +502,9 @@ impl Monitor {
             self.write_raw(format!("{cmd}\r").as_bytes())?;
             if !self.rx_buffered {
                 std::thread::sleep(Duration::from_millis(2));
+            }
+            if self.xemu {
+                std::thread::sleep(Duration::from_millis(20));
             }
             self.t.write_all(&data[off..off + n])?;
             self.read_until(cmd.as_bytes(), Duration::from_secs(3))?;
@@ -536,10 +587,10 @@ impl Registers {
         // LAST-OP is variable width (1-3 bytes shown as one hex string, or blank),
         // which shifts later columns; so locate the flags by shape instead.
         r.last_op = disasm.clone().unwrap_or_default();
-        if let Some(f) = vals.iter().find(|v| v.len() == 8 && v.chars().all(|c| "NVEBDIZC.".contains(c))) {
+        if let Some(f) = vals.iter().find(|v| v.len() == 8 && v.chars().all(|c| "NVEBDIZC.-".contains(c))) {
             r.flags_str = f.to_string();
             for (i, c) in f.chars().enumerate() {
-                if c != '.' {
+                if c != '.' && c != '-' {
                     r.flags |= 0x80 >> i;
                 }
             }

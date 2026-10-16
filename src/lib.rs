@@ -12,6 +12,7 @@
 //! * [`vf011`] serves a local D81 image to the MEGA65's virtual floppy.
 //! * [`jtag`] talks to the FPGA directly through FTDI MPSSE (IDCODE, bitstream load).
 
+pub mod disasm;
 pub mod fat32;
 pub mod jtag;
 pub mod machine;

@@ -93,8 +93,55 @@ impl Transport for TcpTransport {
     }
 }
 
-/// Open a transport from a device string: `tcp:host:port`, `tcp` (localhost:4510), or a serial path.
+/// Xemu's `-uartmon` on macOS/Linux is a unix-domain socket.
+#[cfg(unix)]
+pub struct UnixTransport {
+    stream: std::os::unix::net::UnixStream,
+    name: String,
+}
+
+#[cfg(unix)]
+impl UnixTransport {
+    pub fn connect(path: &str) -> Result<Self> {
+        let stream = std::os::unix::net::UnixStream::connect(path).map_err(|e| Error::Open(format!("{path}: {e}")))?;
+        Ok(Self { stream, name: format!("unix:{path}") })
+    }
+}
+
+#[cfg(unix)]
+impl Transport for UnixTransport {
+    fn write_all(&mut self, data: &[u8]) -> Result<()> {
+        self.stream.write_all(data)?;
+        Ok(())
+    }
+
+    fn read_some(&mut self, buf: &mut [u8], timeout: Duration) -> Result<usize> {
+        self.stream.set_read_timeout(Some(timeout.max(Duration::from_millis(1))))?;
+        match self.stream.read(buf) {
+            Ok(0) => Err(Error::Protocol("socket closed (did Xemu exit?)".into())),
+            Ok(n) => Ok(n),
+            Err(e) if e.kind() == io::ErrorKind::TimedOut || e.kind() == io::ErrorKind::WouldBlock => Ok(0),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn describe(&self) -> String {
+        self.name.clone()
+    }
+}
+
+/// Open a transport from a device string: `tcp:host:port`, `tcp` (localhost:4510),
+/// `unix:/path` (or a path that is a socket), or a serial port path.
 pub fn open(device: &str, baud: u32) -> Result<Box<dyn Transport>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        let path = device.strip_prefix("unix:").unwrap_or(device);
+        let is_socket = std::fs::metadata(path).map(|m| m.file_type().is_socket()).unwrap_or(false);
+        if device.starts_with("unix:") || is_socket {
+            return Ok(Box::new(UnixTransport::connect(path)?));
+        }
+    }
     if let Some(rest) = device.strip_prefix("tcp:") {
         let addr = if rest.contains(':') { rest.to_string() } else { format!("{rest}:4510") };
         Ok(Box::new(TcpTransport::connect(&addr)?))

@@ -112,9 +112,12 @@ enum Cmd {
     /// Disassemble at an address (prefix 777 for the CPU's banked view).
     Dis {
         addr: String,
-        /// Lines of 16 instructions.
+        /// Pages of roughly 16 instructions.
         #[arg(default_value_t = 1)]
         pages: usize,
+        /// Decode on the host instead of asking the monitor (always used for Xemu).
+        #[arg(long)]
+        local: bool,
     },
     /// Reset the MEGA65.
     Reset,
@@ -391,8 +394,16 @@ fn run(cmd: Cmd, mut mach: Machine) -> anyhow::Result<()> {
                 println!("{}", r.raw);
             }
         }
-        Cmd::Dis { addr, pages } => {
+        Cmd::Dis { addr, pages, local } => {
             let mut a = hx(&addr)?;
+            if local || mach.mon.xemu {
+                let mem = mach.mon.read_memory(a, 48 * pages)?;
+                let wide = a >= 0x10000 && (a & 0xfff0000) != 0x7770000;
+                for i in mega65::disasm::disassemble(a, &mem) {
+                    println!("{}", i.format(wide));
+                }
+                return Ok(());
+            }
             for _ in 0..pages {
                 let t = mach.mon.disassemble(a, true)?;
                 println!("{t}");
@@ -414,16 +425,7 @@ fn run(cmd: Cmd, mut mach: Machine) -> anyhow::Result<()> {
         }
         Cmd::Monitor => monitor_repl(&mut mach.mon)?,
         Cmd::Screenshot { png, plain } => {
-            let was = mach.mon.cpu_stopped;
-            mach.mon.stop_cpu()?;
-            let vs = VideoState::capture(&mut mach.mon);
-            let vs = match vs {
-                Ok(v) => v,
-                Err(e) => {
-                    mach.mon.start_cpu()?;
-                    return Err(e.into());
-                }
-            };
+            let vs = mach.mon.with_cpu_paused(VideoState::capture)?;
             if plain || !std::io::stdout().is_terminal() && png.is_none() {
                 print!("{}", vs.to_text());
             } else {
@@ -433,9 +435,6 @@ fn run(cmd: Cmd, mut mach: Machine) -> anyhow::Result<()> {
                 let mut f = std::fs::File::create(&p)?;
                 vs.to_png(&mut mach.mon, &mut f)?;
                 println!("wrote {p} ({}x{}, {} mode)", 720, vs.height(), if vs.pal { "PAL" } else { "NTSC" });
-            }
-            if !was {
-                mach.mon.start_cpu()?;
             }
         }
         Cmd::Type { text, ret, buffer } => {
