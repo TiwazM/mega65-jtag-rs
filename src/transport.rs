@@ -195,3 +195,36 @@ pub fn autodetect_port() -> Option<String> {
     c.sort();
     c.pop()
 }
+
+/// Set the FTDI latency timer (ms) of the UART interface, so the USB serial
+/// driver returns small replies immediately instead of after its 16 ms default.
+/// This is a vendor control request to the device, which works even though
+/// the OS serial driver owns the interface. Best effort: errors are returned
+/// but callers usually ignore them.
+pub fn set_ftdi_latency(ms: u8) -> Result<usize> {
+    use rusb::UsbContext;
+    let ctx = rusb::Context::new()?;
+    let mut done = 0;
+    for dev in ctx.devices()?.iter() {
+        let d = dev.device_descriptor()?;
+        if d.vendor_id() != 0x0403 {
+            continue;
+        }
+        let h = match dev.open() {
+            Ok(h) => h,
+            Err(_) => continue,
+        };
+        // Interface index in wIndex: 1 = A, 2 = B (the MEGA65 UART), 3/4 on FT4232.
+        let n_if = match d.product_id() {
+            0x6011 => 4,
+            0x6010 => 2,
+            _ => 1,
+        };
+        for i in 1..=n_if {
+            if h.write_control(0x40, 9, ms as u16, i, &[], Duration::from_millis(500)).is_ok() {
+                done += 1;
+            }
+        }
+    }
+    Ok(done)
+}

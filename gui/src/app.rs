@@ -32,6 +32,8 @@ struct Settings {
     prg_run: bool,
     prg_binary: bool,
     tab: Tab,
+    prof_flag: String,
+    prof_bucket: u32,
 }
 
 impl Default for Settings {
@@ -51,6 +53,8 @@ impl Default for Settings {
             prg_run: true,
             prg_binary: false,
             tab: Tab::Memory,
+            prof_flag: String::new(),
+            prof_bucket: 16,
         }
     }
 }
@@ -60,6 +64,7 @@ enum Tab {
     Memory,
     Disassembly,
     Screen,
+    Profiler,
     Console,
 }
 
@@ -97,6 +102,11 @@ pub struct StudioApp {
     ports: Vec<String>,
     last_error: Option<String>,
     step_count: usize,
+    prof_on: bool,
+    prof_total: u32,
+    prof_buckets: Vec<(u32, u32)>,
+    prof_rate: f32,
+    fps_history: VecDeque<f32>,
 }
 
 impl StudioApp {
@@ -131,6 +141,11 @@ impl StudioApp {
             ports,
             last_error: None,
             step_count: 1,
+            prof_on: false,
+            prof_total: 0,
+            prof_buckets: Vec::new(),
+            prof_rate: 0.0,
+            fps_history: VecDeque::new(),
         }
     }
 
@@ -162,6 +177,7 @@ impl StudioApp {
                 }
                 Event::Disconnected => {
                     self.connected = false;
+                    self.prof_on = false;
                     self.status = "not connected".into();
                     self.regs = None;
                     self.push_log("disconnected".into());
@@ -194,6 +210,17 @@ impl StudioApp {
                     self.last_error = Some(e);
                 }
                 Event::Busy(b) => self.busy = b,
+                Event::Profile { total, buckets, samples_per_sec, fps } => {
+                    self.prof_total = total;
+                    self.prof_buckets = buckets;
+                    self.prof_rate = samples_per_sec;
+                    if let Some(f) = fps {
+                        self.fps_history.push_back(f);
+                        while self.fps_history.len() > 240 {
+                            self.fps_history.pop_front();
+                        }
+                    }
+                }
                 Event::BreakHit(r) => {
                     self.push_log(format!("CPU stopped at ${:04X} (breakpoint/watchpoint)", r.pc));
                     self.stopped = true;
@@ -558,6 +585,95 @@ impl StudioApp {
         }
     }
 
+    fn send_profiler(&self) {
+        let flag = parse_hex(&self.s.prof_flag).ok();
+        self.backend.send(Cmd::Profiler { enabled: self.prof_on, frame_flag: flag, bucket: self.s.prof_bucket });
+    }
+
+    fn profiler_tab(&mut self, ui: &mut egui::Ui) {
+        let en = self.connected;
+        ui.horizontal_wrapped(|ui| {
+            let label = if self.prof_on { "■ Stop" } else { "● Start" };
+            if ui.add_enabled(en, egui::Button::new(label)).clicked() {
+                self.prof_on = !self.prof_on;
+                self.send_profiler();
+            }
+            if ui.add_enabled(en, egui::Button::new("Reset")).clicked() {
+                self.backend.send(Cmd::ProfilerReset);
+                self.fps_history.clear();
+            }
+            ui.label("bucket:");
+            let mut changed = false;
+            for b in [1u32, 16, 256, 4096] {
+                changed |= ui.selectable_value(&mut self.s.prof_bucket, b, format!("{b}")).changed();
+            }
+            ui.label("frame flag:");
+            let r = ui.add(egui::TextEdit::singleline(&mut self.s.prof_flag).desired_width(70.0).hint_text("hex addr"))
+                .on_hover_text("a byte that changes once per rendered frame; its change rate is shown as fps");
+            changed |= r.lost_focus();
+            if changed && self.prof_on {
+                self.send_profiler();
+            }
+            ui.label(RichText::new(format!("{} samples, {:.0}/s", self.prof_total, self.prof_rate)).weak());
+            if let Some(f) = self.fps_history.back() {
+                ui.label(RichText::new(format!("{f:.0} fps")).strong());
+            }
+        });
+        ui.label(RichText::new("Samples the PC without stopping the CPU; a hot single address right after a DMA trigger or a slow memory read means the CPU was stalled there. Click a row to disassemble it.").weak().small());
+        // fps graph
+        if !self.fps_history.is_empty() {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 80.0), egui::Sense::hover());
+            let p = ui.painter_at(rect);
+            p.rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
+            let max = 62.0f32;
+            for (i, y) in [0.0f32, 30.0, 60.0].iter().enumerate() {
+                let yy = rect.bottom() - y / max * rect.height();
+                p.line_segment([egui::pos2(rect.left(), yy), egui::pos2(rect.right(), yy)], egui::Stroke::new(0.5, ui.visuals().weak_text_color()));
+                if i > 0 {
+                    p.text(egui::pos2(rect.left() + 2.0, yy), egui::Align2::LEFT_BOTTOM, format!("{y:.0}"), egui::FontId::proportional(10.0), ui.visuals().weak_text_color());
+                }
+            }
+            let n = self.fps_history.len().max(2);
+            let w = rect.width() / 240.0;
+            for (i, f) in self.fps_history.iter().enumerate() {
+                let x = rect.right() - (n - i) as f32 * w;
+                let h = (f / max).min(1.0) * rect.height();
+                let col = if *f < 50.0 { Color32::from_rgb(230, 90, 90) } else { Color32::from_rgb(90, 190, 110) };
+                p.rect_filled(egui::Rect::from_min_max(egui::pos2(x, rect.bottom() - h), egui::pos2(x + w.max(1.0), rect.bottom())), 0.0, col);
+            }
+        }
+        let total = self.prof_total.max(1) as f32;
+        let mut goto: Option<u32> = None;
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            egui::Grid::new("profgrid").striped(true).spacing([14.0, 2.0]).show(ui, |ui| {
+                ui.label(RichText::new("share").weak());
+                ui.label(RichText::new("samples").weak());
+                ui.label(RichText::new("address").weak());
+                ui.label("");
+                ui.end_row();
+                for (addr, count) in self.prof_buckets.iter().take(40) {
+                    let share = *count as f32 * 100.0 / total;
+                    ui.label(RichText::new(format!("{share:5.1}%")).monospace());
+                    ui.label(RichText::new(format!("{count}")).monospace());
+                    let range = if self.s.prof_bucket > 1 { format!("${addr:04X}-${:04X}", addr + self.s.prof_bucket - 1) } else { format!("${addr:04X}") };
+                    if ui.add(egui::Label::new(RichText::new(range).monospace()).sense(egui::Sense::click())).clicked() {
+                        goto = Some(*addr);
+                    }
+                    // simple bar
+                    let (r, _) = ui.allocate_exact_size(egui::vec2(160.0, 12.0), egui::Sense::hover());
+                    ui.painter().rect_filled(egui::Rect::from_min_size(r.min, egui::vec2(160.0 * (share / 100.0).min(1.0), 12.0)), 1.0, Color32::from_rgb(255, 170, 60));
+                    ui.end_row();
+                }
+            });
+        });
+        if let Some(a) = goto {
+            self.s.disasm_follow = false;
+            self.s.disasm_addr = format!("777{a:04X}");
+            self.s.tab = Tab::Disassembly;
+            self.send_views();
+        }
+    }
+
     fn console_tab(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label(RichText::new("monitor>").monospace());
@@ -586,6 +702,9 @@ impl eframe::App for StudioApp {
         if self.s.live && self.connected {
             ctx.request_repaint_after(Duration::from_millis(self.s.interval_ms.max(100)));
         }
+        if self.prof_on {
+            ctx.request_repaint_after(Duration::from_millis(250));
+        }
         // Dropped files load as PRGs.
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
         if let Some(p) = dropped.into_iter().next() {
@@ -612,6 +731,7 @@ impl eframe::App for StudioApp {
                 ui.selectable_value(&mut self.s.tab, Tab::Memory, "Memory");
                 ui.selectable_value(&mut self.s.tab, Tab::Disassembly, "Disassembly");
                 ui.selectable_value(&mut self.s.tab, Tab::Screen, "Screen");
+                ui.selectable_value(&mut self.s.tab, Tab::Profiler, if self.prof_on { "Profiler ●" } else { "Profiler" });
                 ui.selectable_value(&mut self.s.tab, Tab::Console, "Console / Log");
             });
             ui.separator();
@@ -619,6 +739,7 @@ impl eframe::App for StudioApp {
                 Tab::Memory => self.memory_tab(ui),
                 Tab::Disassembly => self.disasm_tab(ui),
                 Tab::Screen => self.screen_tab(ui),
+                Tab::Profiler => self.profiler_tab(ui),
                 Tab::Console => self.console_tab(ui),
             }
         });

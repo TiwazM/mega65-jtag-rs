@@ -43,6 +43,11 @@ pub enum Cmd {
     Video { pal: bool },
     /// Live polling of registers/memory/disassembly (and optionally the screen).
     SetLive { enabled: bool, interval: Duration, screen: bool },
+    /// Continuous PC sampling; `frame_flag` is a byte that changes once per
+    /// rendered frame (its change rate is reported as fps). Replaces normal
+    /// polling while enabled.
+    Profiler { enabled: bool, frame_flag: Option<u32>, bucket: u32 },
+    ProfilerReset,
     Shutdown,
 }
 
@@ -59,6 +64,9 @@ pub enum Event {
     Busy(bool),
     /// The CPU stopped on its own (breakpoint/watchpoint).
     BreakHit(Registers),
+    /// Profiler snapshot: total samples, (bucket address, count) sorted by count,
+    /// sampling rate, and the frame flag's change rate if one is configured.
+    Profile { total: u32, buckets: Vec<(u32, u32)>, samples_per_sec: f32, fps: Option<f32> },
 }
 
 pub struct Backend {
@@ -105,6 +113,11 @@ struct Worker {
     last_poll: Instant,
     last_regs: Option<Registers>,
     armed: bool,
+    prof_on: bool,
+    prof_flag: Option<u32>,
+    prof_bucket: u32,
+    prof_hist: std::collections::HashMap<u32, u32>,
+    prof_total: u32,
 }
 
 impl Worker {
@@ -122,6 +135,11 @@ impl Worker {
             last_poll: Instant::now(),
             last_regs: None,
             armed: false,
+            prof_on: false,
+            prof_flag: None,
+            prof_bucket: 16,
+            prof_hist: Default::default(),
+            prof_total: 0,
         }
     }
 
@@ -136,6 +154,25 @@ impl Worker {
 
     fn run(mut self) {
         loop {
+            if self.prof_on && self.mach.is_some() {
+                // Profiling owns the link: sample for half a second, then look
+                // for commands, and repeat.
+                if let Err(e) = self.profile_burst() {
+                    self.emit(Event::Error(e.to_string()));
+                    self.prof_on = false;
+                }
+                match self.rx.try_recv() {
+                    Ok(Cmd::Shutdown) => break,
+                    Ok(cmd) => {
+                        if let Err(e) = self.handle(cmd) {
+                            self.emit(Event::Error(e.to_string()));
+                        }
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                    Err(_) => {}
+                }
+                continue;
+            }
             let wait = if self.live && self.mach.is_some() {
                 self.interval.saturating_sub(self.last_poll.elapsed()).max(Duration::from_millis(10))
             } else {
@@ -301,6 +338,25 @@ impl Worker {
                 self.mach()?.set_video(pal)?;
                 self.log(if pal { "PAL" } else { "NTSC" });
             }
+            Cmd::Profiler { enabled, frame_flag, bucket } => {
+                if enabled && !self.prof_on {
+                    self.mach()?.mon.sync()?;
+                }
+                self.prof_on = enabled;
+                self.prof_flag = frame_flag;
+                if self.prof_bucket != bucket.max(1) {
+                    self.prof_hist.clear();
+                    self.prof_total = 0;
+                }
+                self.prof_bucket = bucket.max(1);
+                if !enabled {
+                    self.refresh_all()?;
+                }
+            }
+            Cmd::ProfilerReset => {
+                self.prof_hist.clear();
+                self.prof_total = 0;
+            }
             Cmd::SetLive { enabled, interval, screen } => {
                 self.live = enabled;
                 self.interval = interval;
@@ -308,6 +364,51 @@ impl Worker {
             }
             Cmd::Shutdown => {}
         }
+        Ok(())
+    }
+
+    /// One profiler period: count frame-flag changes for 200 ms (if a flag is
+    /// set), sample the PC for 300 ms, then emit a snapshot.
+    fn profile_burst(&mut self) -> mega65::Result<()> {
+        let bucket = self.prof_bucket;
+        let flag = self.prof_flag;
+        let m = self.mach()?;
+        let mut fps = None;
+        if let Some(a) = flag {
+            let t0 = Instant::now();
+            let (mut changes, mut last) = (0u32, None);
+            while t0.elapsed() < Duration::from_millis(200) {
+                let v = m.mon.peek_fast(a)?;
+                if last.map(|l| l != v).unwrap_or(false) {
+                    changes += 1;
+                }
+                last = Some(v);
+            }
+            fps = Some(changes as f32 / t0.elapsed().as_secs_f32());
+        }
+        let t1 = Instant::now();
+        let mut pcs: Vec<u32> = Vec::with_capacity(256);
+        let mut last_regs = None;
+        while t1.elapsed() < Duration::from_millis(300) {
+            let r = m.mon.registers_fast()?;
+            pcs.push(r.pc as u32 / bucket * bucket);
+            last_regs = Some(r);
+        }
+        let n = pcs.len() as u32;
+        let rate = n as f32 / t1.elapsed().as_secs_f32();
+        for pc in pcs {
+            *self.prof_hist.entry(pc).or_default() += 1;
+        }
+        self.prof_total += n;
+        if let Some(r) = last_regs {
+            let stopped = self.mach()?.mon.cpu_stopped;
+            self.last_regs = Some(r.clone());
+            self.emit(Event::Registers { regs: r, stopped });
+        }
+        let mut buckets: Vec<(u32, u32)> = self.prof_hist.iter().map(|(a, c)| (*a, *c)).collect();
+        buckets.sort_by(|a, b| b.1.cmp(&a.1));
+        buckets.truncate(64);
+        self.emit(Event::Profile { total: self.prof_total, buckets, samples_per_sec: rate, fps });
         Ok(())
     }
 

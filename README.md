@@ -36,6 +36,9 @@ current banking, e.g. `777080d`):
 | `dis ADDR [PAGES]` | disassemble |
 | `reset` / `bootslot N` | reset, or reboot the FPGA into core slot N (nothing is flashed) |
 | `raw CMD` / `monitor` | send a raw monitor command, or get an interactive monitor |
+| `profile [SECS] [--bucket N]` | statistical profiler: sample the PC and list the hottest addresses |
+| `sample ADDR [SECS]` / `fps-profile ADDR [SECS]` | how often a byte changes (a per-frame flag gives the fps); fps-profile also bins PC samples into normal vs dip seconds |
+| `disasm-file FILE [--addr A] [--from A]` | disassemble a PRG or memory snapshot on the host |
 
 Screen and input:
 
@@ -69,8 +72,10 @@ builds the same on macOS, Windows and Linux):
   loader (Browse or drag a file onto the window), memory save, virtual keyboard,
   GO64 / PAL / NTSC;
 - tabs: two live hex memory views (click a byte to edit it), disassembly that
-  follows PC, screen capture (optionally on every poll, save as PNG), and a
-  console for raw monitor commands with the log.
+  follows PC, screen capture (optionally on every poll, save as PNG), a
+  profiler (continuous PC sampling without stopping the CPU: hot-address table
+  with click-to-disassemble, and a frame-rate graph from any byte that changes
+  once per rendered frame), and a console for raw monitor commands with the log.
 
 All hardware traffic runs on one worker thread, so the UI never blocks and
 panels can't interleave commands. Settings persist between runs.

@@ -78,6 +78,10 @@ impl Monitor {
 
     /// Open the transport and synchronise with the monitor.
     pub fn connect(device: &str, baud: u32) -> Result<Self> {
+        if device.contains("usbserial") || device.contains("ttyUSB") || device.starts_with("COM") {
+            // 1 ms FTDI latency instead of 16 ms: every monitor round trip gets faster.
+            let _ = crate::transport::set_ftdi_latency(1);
+        }
         let t = crate::transport::open(device, baud)?;
         let mut m = Self::new(t);
         if std::env::var_os("M65_DEBUG_SERIAL").is_some() {
