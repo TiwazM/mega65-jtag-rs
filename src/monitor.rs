@@ -32,7 +32,7 @@ use crate::transport::Transport;
 use crate::{Error, Result};
 
 /// Largest chunk the `l` command accepts in one go.
-const LOAD_CHUNK: usize = 4096;
+const LOAD_CHUNK: usize = 16384;
 
 /// Parsed output of the `r` command.
 #[derive(Debug, Clone, Default)]
@@ -128,8 +128,10 @@ impl Monitor {
 
     /// Discard pending input, keeping note of any breakpoint reports in it.
     pub fn purge(&mut self) -> Result<()> {
+        // With the FTDI latency timer at 1 ms a quiet link answers in ~1 ms.
+        let t = if self.pace_writes { 5 } else { 1 };
         loop {
-            if self.fill(Duration::from_millis(5))? == 0 {
+            if self.fill(Duration::from_millis(t))? == 0 {
                 break;
             }
         }

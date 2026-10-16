@@ -290,6 +290,9 @@ enum SdCmd {
     Mount { name: String },
     /// Print a file's cluster chain.
     Clusters { path: String },
+    /// Self-check of SD multi-sector writes: rewrites a run of this file's own
+    /// sectors with identical data and verifies the run and its neighbours.
+    VerifyMultiwrite { path: String },
 }
 
 #[derive(Args)]
@@ -771,7 +774,7 @@ fn sd_cmd(cli: &Cli, args: &SdArgs) -> anyhow::Result<()> {
             return Ok(());
         }
         let mut fs = Fat32::open(dev)?;
-        let r = sd_run(&mut fs, &args.cmd);
+        let r = if let SdCmd::VerifyMultiwrite { path } = &args.cmd { verify_multiwrite(&mut fs, path) } else { sd_run(&mut fs, &args.cmd) };
         fs.close()?;
         if !args.keep {
             fs.cache.dev.quit()?;
@@ -843,6 +846,7 @@ fn sd_run<D: BlockDevice>(fs: &mut Fat32<D>, cmd: &SdCmd) -> anyhow::Result<()> 
             print!("{}", hexdump(0, &fs.read_sector(n)?));
         }
         SdCmd::Mount { .. } => bail!("mount needs the helper (run without --direct)"),
+        SdCmd::VerifyMultiwrite { .. } => bail!("verify-multiwrite needs the helper (run without --direct)"),
         SdCmd::Clusters { path } => {
             let e = fs.lookup(path)?.context("root has no cluster chain")?;
             let chain = fs.chain(e.cluster)?;
@@ -858,6 +862,48 @@ impl SdCmd {
             SdCmd::Mount { name } => Some(name),
             _ => None,
         }
+    }
+}
+
+/// Rewrite up to 32 consecutive sectors of `path` with their own data using the
+/// multi-sector path, then read the run plus two sectors either side back and
+/// compare with what was there before. Identical data in, so nothing can be
+/// lost; a misdirected write would change a neighbour or shift the run.
+fn verify_multiwrite(fs: &mut Fat32<HelperSd<'_>>, path: &str) -> anyhow::Result<()> {
+    let e = fs.lookup(path)?.context("file not found")?;
+    let chain = fs.chain(e.cluster)?;
+    let spc = fs.spc as usize;
+    // Longest run of consecutive clusters.
+    let (mut best, mut best_len, mut i) = (0usize, 0usize, 0usize);
+    while i < chain.len() {
+        let mut j = i;
+        while j + 1 < chain.len() && chain[j + 1] == chain[j] + 1 {
+            j += 1;
+        }
+        if j - i + 1 > best_len {
+            best = i;
+            best_len = j - i + 1;
+        }
+        i = j + 1;
+    }
+    let run_sectors = (best_len * spc).min(32);
+    anyhow::ensure!(run_sectors >= 4, "file has no run of 4+ consecutive sectors");
+    let first = fs.cluster_sector(chain[best]);
+    let lo = first - 2;
+    let total = run_sectors + 4;
+    println!("run: {run_sectors} sectors from {first}; checking sectors {lo}..{}", lo + total as u32 - 1);
+    let before = fs.cache.dev.read_sectors(lo, total)?;
+    let data = before[2 * 512..(2 + run_sectors) * 512].to_vec();
+    let t = std::time::Instant::now();
+    fs.cache.dev.write_run_now(first, &data)?;
+    println!("multi-sector write of {run_sectors} sectors took {:?}", t.elapsed());
+    let after = fs.cache.dev.read_sectors(lo, total)?;
+    if before == after {
+        println!("OK: run and neighbours identical after the multi-sector write");
+        Ok(())
+    } else {
+        let diff: Vec<usize> = (0..total).filter(|k| before[k * 512..(k + 1) * 512] != after[k * 512..(k + 1) * 512]).collect();
+        bail!("MISMATCH in sectors {:?} (offsets from {lo}); use M65_SD_SINGLE_WRITES=1", diff)
     }
 }
 

@@ -134,6 +134,9 @@ impl BlockDevice for DirectSd<'_> {
 pub struct HelperSd<'a> {
     pub mon: &'a mut Monitor,
     pending_writes: BTreeMap<u32, Vec<u8>>,
+    /// Use SD multi-sector writes for runs of consecutive sectors
+    /// (set `M65_SD_SINGLE_WRITES=1` to disable).
+    pub multi_write: bool,
 }
 
 impl<'a> HelperSd<'a> {
@@ -146,7 +149,7 @@ impl<'a> HelperSd<'a> {
         mon.write_raw(b"sc001 13\rsc000 1\r")?;
         let reply = mon.read_quiet(Duration::from_millis(200), Duration::from_millis(1500))?;
         if find(&reply, b"MEGA65FT1.0") {
-            return Ok(Self { mon: &mut mach.mon, pending_writes: BTreeMap::new() });
+            return Ok(Self { mon: &mut mach.mon, pending_writes: BTreeMap::new(), multi_write: std::env::var_os("M65_SD_SINGLE_WRITES").is_none() });
         }
         mach.detect_mode(Duration::from_secs(10))?;
         if !force {
@@ -180,7 +183,7 @@ impl<'a> HelperSd<'a> {
         if !find(&reply, b"MEGA65FT1.0") {
             return Err(Error::Protocol("SD helper did not start".into()));
         }
-        Ok(Self { mon: &mut mach.mon, pending_writes: BTreeMap::new() })
+        Ok(Self { mon: &mut mach.mon, pending_writes: BTreeMap::new(), multi_write: std::env::var_os("M65_SD_SINGLE_WRITES").is_none() })
     }
 
     /// Run a batch of jobs and collect any raw data they stream back.
@@ -247,7 +250,7 @@ impl BlockDevice for HelperSd<'_> {
         let mut s = first;
         let mut left = count;
         while left > 0 {
-            let n = left.min(128);
+            let n = left.min(256);
             let mut job = vec![0x04u8];
             job.extend_from_slice(&(n as u16).to_le_bytes());
             job.extend_from_slice(&s.to_le_bytes());
@@ -262,7 +265,8 @@ impl BlockDevice for HelperSd<'_> {
         let mut buf = data.to_vec();
         buf.resize(SECTOR, 0);
         self.pending_writes.insert(sector, buf);
-        if self.pending_writes.len() >= 64 {
+        // 128 sectors = the whole 64 KB staging bank in one upload and one batch.
+        if self.pending_writes.len() >= 128 {
             self.flush()?;
         }
         Ok(())
@@ -275,11 +279,37 @@ impl BlockDevice for HelperSd<'_> {
         let writes = std::mem::take(&mut self.pending_writes);
         let mut staging = Vec::with_capacity(writes.len() * SECTOR);
         let mut jobs = Vec::new();
-        for (i, (sector, data)) in writes.iter().enumerate() {
-            staging.extend_from_slice(data);
-            jobs.push(0x02);
-            jobs.extend_from_slice(&(HELPER_STAGING + (i as u32) * SECTOR as u32).to_le_bytes());
-            jobs.extend_from_slice(&sector.to_le_bytes());
+        let entries: Vec<(u32, &Vec<u8>)> = writes.iter().map(|(s, d)| (*s, d)).collect();
+        // Runs of consecutive sectors go out as SD multi-sector writes (helper
+        // jobs 05 first / 06 middle / 07 last -> $D680 commands $04/$05/$06),
+        // which the card handles far faster than one command per sector.
+        let multi = self.multi_write;
+        let mut i = 0;
+        while i < entries.len() {
+            let mut run = 1;
+            while i + run < entries.len() && entries[i + run].0 == entries[i].0 + run as u32 {
+                run += 1;
+            }
+            for k in 0..run {
+                let (sector, data) = entries[i + k];
+                let addr = HELPER_STAGING + ((i + k) as u32) * SECTOR as u32;
+                staging.extend_from_slice(data);
+                let job = if multi && run >= 4 {
+                    if k == 0 {
+                        0x05
+                    } else if k == run - 1 {
+                        0x07
+                    } else {
+                        0x06
+                    }
+                } else {
+                    0x02
+                };
+                jobs.push(job);
+                jobs.extend_from_slice(&addr.to_le_bytes());
+                jobs.extend_from_slice(&sector.to_le_bytes());
+            }
+            i += run;
         }
         self.mon.write_memory(HELPER_STAGING, &staging)?;
         self.execute(&jobs, writes.len(), 0)?;
@@ -287,7 +317,7 @@ impl BlockDevice for HelperSd<'_> {
     }
 
     fn preferred_batch(&self) -> usize {
-        128
+        256
     }
 
     fn close(&mut self) -> Result<()> {
@@ -296,6 +326,19 @@ impl BlockDevice for HelperSd<'_> {
 }
 
 impl HelperSd<'_> {
+    /// Write consecutive sectors right now (used by the multi-write self-check).
+    pub fn write_run_now(&mut self, first: u32, data: &[u8]) -> Result<()> {
+        self.flush()?;
+        for (i, chunk) in data.chunks(SECTOR).enumerate() {
+            self.pending_writes.insert(first + i as u32, {
+                let mut v = chunk.to_vec();
+                v.resize(SECTOR, 0);
+                v
+            });
+        }
+        self.flush()
+    }
+
     /// Ask the helper to mount a D81 from the SD card root (helper job 0x12).
     pub fn mount_d81(&mut self, name: &str) -> Result<()> {
         self.flush()?;
@@ -372,7 +415,7 @@ impl<D: BlockDevice> SectorCache<D> {
         }
         self.clean.remove(&sector);
         self.dirty.insert(sector, d);
-        if self.dirty.len() >= 64 {
+        if self.dirty.len() >= 128 {
             self.flush()?;
         }
         Ok(())
