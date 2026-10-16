@@ -76,10 +76,18 @@ All hardware traffic runs on one worker thread, so the UI never blocks and
 panels can't interleave commands. Settings persist between runs.
 `m65-studio --selftest DEVICE` exercises that worker without a window.
 
+### macOS app bundle
+
+`gui/macos/build-app.sh --install` builds "MEGA65 Studio.app" (icon, Info.plist,
+ad-hoc signed) into `target/macos/` and copies it to `~/Applications`, so it can
+be launched from Spotlight or Launchpad and kept in the Dock. It needs only the
+system `sips`, `iconutil` and `codesign`.
+
 ### Xemu as a backend
 
 Start Xemu with its UART monitor (`xmega65 -uartmon /tmp/xemu-umon.sock` on
-macOS/Linux, `-uartmon :4510` on Windows) and connect to that socket or
+macOS/Linux, `-uartmon :4510` on Windows; add `-besure` to skip its exit
+confirmation and `-headless` for windowless test runs) and connect to that socket or
 `tcp:localhost:4510`. Memory, registers, disassembly, screenshots, PRG loading
 and typing all work. Xemu's monitor has no `l` fast-load (writes go through `s`,
 so they're slower) and no `#` no-op, and the Xemu "next" builds from 2026 crash
