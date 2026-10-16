@@ -107,6 +107,8 @@ pub struct StudioApp {
     prof_buckets: Vec<(u32, u32)>,
     prof_rate: f32,
     fps_history: VecDeque<f32>,
+    progress: Option<(usize, usize)>,
+    flag_candidates: Vec<mega65::probe::FlagCandidate>,
 }
 
 impl StudioApp {
@@ -146,6 +148,8 @@ impl StudioApp {
             prof_buckets: Vec::new(),
             prof_rate: 0.0,
             fps_history: VecDeque::new(),
+            progress: None,
+            flag_candidates: Vec::new(),
         }
     }
 
@@ -220,6 +224,11 @@ impl StudioApp {
                             self.fps_history.pop_front();
                         }
                     }
+                }
+                Event::Progress(p) => self.progress = p,
+                Event::FrameFlagCandidates(v) => {
+                    self.push_log(format!("frame flag scan: {} candidates", v.len()));
+                    self.flag_candidates = v;
                 }
                 Event::BreakHit(r) => {
                     self.push_log(format!("CPU stopped at ${:04X} (breakpoint/watchpoint)", r.pc));
@@ -611,6 +620,16 @@ impl StudioApp {
             let r = ui.add(egui::TextEdit::singleline(&mut self.s.prof_flag).desired_width(70.0).hint_text("hex addr"))
                 .on_hover_text("a byte that changes once per rendered frame; its change rate is shown as fps");
             changed |= r.lost_focus();
+            if ui.add_enabled(en && self.progress.is_none(), egui::Button::new("Find…"))
+                .on_hover_text("scan memory for bytes that change once per frame (takes ~10-30 s)")
+                .clicked()
+            {
+                self.flag_candidates.clear();
+                self.backend.send(Cmd::FindFrameFlag);
+            }
+            if let Some((d, t)) = self.progress {
+                ui.add(egui::ProgressBar::new(d as f32 / t.max(1) as f32).desired_width(120.0).show_percentage());
+            }
             if changed && self.prof_on {
                 self.send_profiler();
             }
@@ -619,6 +638,24 @@ impl StudioApp {
                 ui.label(RichText::new(format!("{f:.0} fps")).strong());
             }
         });
+        if !self.flag_candidates.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("candidates (click to use):").weak());
+                let mut pick = None;
+                for c in self.flag_candidates.iter().take(12) {
+                    if ui.small_button(c.describe()).clicked() {
+                        pick = Some(c.addr);
+                    }
+                }
+                if let Some(a) = pick {
+                    self.s.prof_flag = format!("{a:04X}");
+                    self.fps_history.clear();
+                    if self.prof_on {
+                        self.send_profiler();
+                    }
+                }
+            });
+        }
         ui.label(RichText::new("Samples the PC without stopping the CPU; a hot single address right after a DMA trigger or a slow memory read means the CPU was stalled there. Click a row to disassemble it.").weak().small());
         // fps graph
         if !self.fps_history.is_empty() {

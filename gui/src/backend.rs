@@ -48,6 +48,8 @@ pub enum Cmd {
     /// polling while enabled.
     Profiler { enabled: bool, frame_flag: Option<u32>, bucket: u32 },
     ProfilerReset,
+    /// Scan memory for bytes that change once per frame.
+    FindFrameFlag,
     Shutdown,
 }
 
@@ -67,6 +69,9 @@ pub enum Event {
     /// Profiler snapshot: total samples, (bucket address, count) sorted by count,
     /// sampling rate, and the frame flag's change rate if one is configured.
     Profile { total: u32, buckets: Vec<(u32, u32)>, samples_per_sec: f32, fps: Option<f32> },
+    /// Progress of a long operation, (done, total), or None when finished.
+    Progress(Option<(usize, usize)>),
+    FrameFlagCandidates(Vec<mega65::probe::FlagCandidate>),
 }
 
 pub struct Backend {
@@ -352,6 +357,20 @@ impl Worker {
                 if !enabled {
                     self.refresh_all()?;
                 }
+            }
+            Cmd::FindFrameFlag => {
+                let was = self.prof_on;
+                self.prof_on = false;
+                let tx = self.tx.clone();
+                let ctx = self.ctx.clone();
+                let m = self.mach()?;
+                let r = mega65::probe::find_frame_flags(&mut m.mon, 0x7770200, 0x777d000, 4, 100, 5.0, 130.0, |d, t| {
+                    let _ = tx.send(Event::Progress(Some((d, t))));
+                    ctx.request_repaint();
+                });
+                self.emit(Event::Progress(None));
+                self.emit(Event::FrameFlagCandidates(r?));
+                self.prof_on = was;
             }
             Cmd::ProfilerReset => {
                 self.prof_hist.clear();

@@ -163,6 +163,17 @@ enum Cmd {
         #[arg(long, default_value_t = 20)]
         top: usize,
     },
+    /// Find bytes that change once per frame (frame counters, buffer flags)
+    /// for use with `sample`, `fps-profile` and Studio's profiler.
+    FindFlag {
+        /// Range to scan (CPU view by default).
+        #[arg(long, default_value = "7770200")]
+        start: String,
+        #[arg(long, default_value = "777d000")]
+        end: String,
+        #[arg(long, default_value_t = 4)]
+        passes: usize,
+    },
     /// Reset the MEGA65.
     Reset,
     /// Send a raw monitor command and print the reply.
@@ -573,6 +584,22 @@ fn run(cmd: Cmd, mut mach: Machine) -> anyhow::Result<()> {
             println!("\n{dip_secs} dip seconds (rate < {threshold}/s)");
             report("normal frames", &normal, nn);
             report("dip frames", &dip, nd);
+        }
+        Cmd::FindFlag { start, end, passes } => {
+            let (s, e) = (hx(&start)?, hx(&end)?);
+            eprintln!("scanning ${s:07X}-${e:07X} ({passes} passes)...");
+            let found = mega65::probe::find_frame_flags(&mut mach.mon, s, e, passes, 100, 5.0, 130.0, |done, total| {
+                if std::io::stderr().is_terminal() {
+                    eprint!("\r{done}/{total}   ");
+                }
+            })?;
+            eprintln!();
+            if found.is_empty() {
+                println!("no frame-like bytes found (is the program animating?)");
+            }
+            for c in found.iter().take(30) {
+                println!("{}", c.describe());
+            }
         }
         Cmd::Reset => {
             mach.reset()?;

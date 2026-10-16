@@ -39,6 +39,7 @@ current banking, e.g. `777080d`):
 | `profile [SECS] [--bucket N]` | statistical profiler: sample the PC and list the hottest addresses |
 | `sample ADDR [SECS]` / `fps-profile ADDR [SECS]` | how often a byte changes (a per-frame flag gives the fps); fps-profile also bins PC samples into normal vs dip seconds |
 | `disasm-file FILE [--addr A] [--from A]` | disassemble a PRG or memory snapshot on the host |
+| `find-flag` | scan memory for bytes that change once per frame (frame counters, flip flags) to feed `sample`/`fps-profile`/the profiler |
 
 Screen and input:
 

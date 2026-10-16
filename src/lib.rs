@@ -18,6 +18,7 @@ pub mod jtag;
 pub mod machine;
 pub mod monitor;
 pub mod petscii;
+pub mod probe;
 pub mod screen;
 pub mod sdcard;
 pub mod transport;
