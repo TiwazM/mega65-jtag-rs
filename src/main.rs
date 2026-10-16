@@ -119,6 +119,35 @@ enum Cmd {
         #[arg(long)]
         local: bool,
     },
+    /// Disassemble a PRG or binary file on the host (no hardware needed).
+    DisasmFile {
+        file: String,
+        /// Load address for raw binaries (PRG files carry their own).
+        #[arg(long)]
+        addr: Option<String>,
+        /// Start at this offset into the file's address space.
+        #[arg(long)]
+        from: Option<String>,
+    },
+    /// Statistical profiler: sample the PC for a while and show the hottest addresses.
+    Profile {
+        /// Seconds to sample.
+        #[arg(default_value_t = 5)]
+        seconds: u64,
+        /// Bucket size in bytes (1 = exact addresses).
+        #[arg(long, default_value_t = 16)]
+        bucket: u32,
+        /// Number of buckets to show.
+        #[arg(long, default_value_t = 25)]
+        top: usize,
+    },
+    /// Sample one byte as fast as possible and report how often it changes
+    /// (e.g. a frame counter or buffer index gives the frame rate).
+    Sample {
+        addr: String,
+        #[arg(default_value_t = 5)]
+        seconds: u64,
+    },
     /// Reset the MEGA65.
     Reset,
     /// Send a raw monitor command and print the reply.
@@ -271,6 +300,19 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Jtag(j) => jtag_cmd(j),
+        Cmd::DisasmFile { file, addr, from } => {
+            let bytes = std::fs::read(file)?;
+            let (base, data) = match addr {
+                Some(a) => (parse_hex(a).map_err(anyhow::Error::msg)?, &bytes[..]),
+                None => (u16::from_le_bytes([bytes[0], bytes[1]]) as u32, &bytes[2..]),
+            };
+            let start = match from { Some(f) => parse_hex(f).map_err(anyhow::Error::msg)?, None => base };
+            let off = (start - base) as usize;
+            for i in mega65::disasm::disassemble(start, &data[off.min(data.len())..]) {
+                println!("{}", i.format(false));
+            }
+            Ok(())
+        }
         Cmd::Sd(s) => sd_cmd(&cli, s),
         _ => {
             let mon = connect(&cli)?;
@@ -416,6 +458,46 @@ fn run(cmd: Cmd, mut mach: Machine) -> anyhow::Result<()> {
                 }
             }
         }
+        Cmd::Profile { seconds, bucket, top } => {
+            let mut hist: std::collections::HashMap<u32, u32> = Default::default();
+            let mut raw_pcs: std::collections::HashMap<u16, u32> = Default::default();
+            let start = std::time::Instant::now();
+            let mut n = 0u32;
+            while start.elapsed() < Duration::from_secs(seconds) {
+                let r = mach.mon.registers()?;
+                *hist.entry(r.pc as u32 / bucket.max(1) * bucket.max(1)).or_default() += 1;
+                *raw_pcs.entry(r.pc).or_default() += 1;
+                n += 1;
+            }
+            let mut v: Vec<_> = hist.into_iter().collect();
+            v.sort_by(|a, b| b.1.cmp(&a.1));
+            println!("{n} samples in {seconds}s ({} / s), {} distinct PCs", n / seconds.max(1) as u32, raw_pcs.len());
+            println!(" share   samples  address");
+            let mut shown = 0u32;
+            for (a, c) in v.iter().take(top) {
+                println!("{:5.1}%  {:8}  ${:04X}-${:04X}", *c as f64 * 100.0 / n as f64, c, a, a + bucket.max(1) - 1);
+                shown += c;
+            }
+            println!("{:5.1}%  {:8}  (everything else)", (n - shown) as f64 * 100.0 / n as f64, n - shown);
+        }
+        Cmd::Sample { addr, seconds } => {
+            let a = hx(&addr)?;
+            let start = std::time::Instant::now();
+            let (mut n, mut changes) = (0u32, 0u32);
+            let mut last: Option<u8> = None;
+            let mut seen = std::collections::BTreeSet::new();
+            while start.elapsed() < Duration::from_secs(seconds) {
+                let v = mach.mon.peek(a)?;
+                if last.map(|l| l != v).unwrap_or(false) {
+                    changes += 1;
+                }
+                seen.insert(v);
+                last = Some(v);
+                n += 1;
+            }
+            let secs = start.elapsed().as_secs_f64();
+            println!("${a:07X}: {n} samples ({:.0}/s), {changes} changes ({:.1}/s), values seen: {:?}", n as f64 / secs, changes as f64 / secs, seen);
+        }
         Cmd::Reset => {
             mach.reset()?;
             println!("reset");
@@ -464,7 +546,7 @@ fn run(cmd: Cmd, mut mach: Machine) -> anyhow::Result<()> {
             println!("{} reads, {} writes", vf.reads, vf.writes);
             r?;
         }
-        Cmd::Ports | Cmd::Sd(_) | Cmd::Jtag(_) => unreachable!(),
+        Cmd::Ports | Cmd::Sd(_) | Cmd::Jtag(_) | Cmd::DisasmFile { .. } => unreachable!(),
     }
     Ok(())
 }
