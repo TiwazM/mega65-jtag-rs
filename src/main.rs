@@ -148,6 +148,21 @@ enum Cmd {
         #[arg(default_value_t = 5)]
         seconds: u64,
     },
+    /// Watch a per-frame byte for frame-rate dips and profile the PC during them.
+    /// Each second: count changes of ADDR for 700 ms, then sample the PC for 300 ms;
+    /// the samples are binned as "normal" or "dip" by that second's rate.
+    FpsProfile {
+        addr: String,
+        #[arg(default_value_t = 300)]
+        seconds: u64,
+        /// Changes per second below which a second counts as a dip.
+        #[arg(long, default_value_t = 50)]
+        threshold: u32,
+        #[arg(long, default_value_t = 16)]
+        bucket: u32,
+        #[arg(long, default_value_t = 20)]
+        top: usize,
+    },
     /// Reset the MEGA65.
     Reset,
     /// Send a raw monitor command and print the reply.
@@ -463,8 +478,9 @@ fn run(cmd: Cmd, mut mach: Machine) -> anyhow::Result<()> {
             let mut raw_pcs: std::collections::HashMap<u16, u32> = Default::default();
             let start = std::time::Instant::now();
             let mut n = 0u32;
+            mach.mon.sync()?;
             while start.elapsed() < Duration::from_secs(seconds) {
-                let r = mach.mon.registers()?;
+                let r = mach.mon.registers_fast()?;
                 *hist.entry(r.pc as u32 / bucket.max(1) * bucket.max(1)).or_default() += 1;
                 *raw_pcs.entry(r.pc).or_default() += 1;
                 n += 1;
@@ -486,17 +502,77 @@ fn run(cmd: Cmd, mut mach: Machine) -> anyhow::Result<()> {
             let (mut n, mut changes) = (0u32, 0u32);
             let mut last: Option<u8> = None;
             let mut seen = std::collections::BTreeSet::new();
+            let mut sec_changes = 0u32;
+            let mut sec_start = std::time::Instant::now();
+            mach.mon.sync()?;
             while start.elapsed() < Duration::from_secs(seconds) {
-                let v = mach.mon.peek(a)?;
+                let v = mach.mon.peek_fast(a)?;
                 if last.map(|l| l != v).unwrap_or(false) {
                     changes += 1;
+                    sec_changes += 1;
+                }
+                if sec_start.elapsed() >= Duration::from_secs(1) {
+                    println!("t={:4}s  {} changes/s", start.elapsed().as_secs(), sec_changes);
+                    sec_changes = 0;
+                    sec_start = std::time::Instant::now();
                 }
                 seen.insert(v);
                 last = Some(v);
                 n += 1;
             }
             let secs = start.elapsed().as_secs_f64();
-            println!("${a:07X}: {n} samples ({:.0}/s), {changes} changes ({:.1}/s), values seen: {:?}", n as f64 / secs, changes as f64 / secs, seen);
+            println!("${a:07X}: {n} samples ({:.0}/s), {changes} changes ({:.1}/s), {} distinct values", n as f64 / secs, changes as f64 / secs, seen.len());
+        }
+        Cmd::FpsProfile { addr, seconds, threshold, bucket, top } => {
+            let a = hx(&addr)?;
+            let b = bucket.max(1);
+            let mut normal: std::collections::HashMap<u32, u32> = Default::default();
+            let mut dip: std::collections::HashMap<u32, u32> = Default::default();
+            let (mut nn, mut nd, mut dip_secs) = (0u32, 0u32, 0u32);
+            let start = std::time::Instant::now();
+            mach.mon.sync()?;
+            while start.elapsed() < Duration::from_secs(seconds) {
+                let t0 = std::time::Instant::now();
+                let mut changes = 0u32;
+                let mut last = None;
+                while t0.elapsed() < Duration::from_millis(700) {
+                    let v = mach.mon.peek_fast(a)?;
+                    if last.map(|l| l != v).unwrap_or(false) {
+                        changes += 1;
+                    }
+                    last = Some(v);
+                }
+                // Scale the 700 ms count to a per-second rate.
+                let rate = changes * 10 / 7;
+                let mut pcs = Vec::new();
+                let t1 = std::time::Instant::now();
+                while t1.elapsed() < Duration::from_millis(300) {
+                    pcs.push(mach.mon.registers_fast()?.pc as u32 / b * b);
+                }
+                let is_dip = rate < threshold;
+                let hist = if is_dip { &mut dip } else { &mut normal };
+                for pc in &pcs {
+                    *hist.entry(*pc).or_default() += 1;
+                }
+                if is_dip {
+                    nd += pcs.len() as u32;
+                    dip_secs += 1;
+                } else {
+                    nn += pcs.len() as u32;
+                }
+                println!("t={:4}s  {:3}/s {}", start.elapsed().as_secs(), rate, if is_dip { "DIP" } else { "" });
+            }
+            let report = |name: &str, h: &std::collections::HashMap<u32, u32>, n: u32| {
+                let mut v: Vec<_> = h.iter().collect();
+                v.sort_by(|x, y| y.1.cmp(x.1));
+                println!("\n== {name}: {n} samples");
+                for (addr, c) in v.iter().take(top) {
+                    println!("{:5.1}%  {:6}  ${:04X}-${:04X}", **c as f64 * 100.0 / n.max(1) as f64, c, *addr, *addr + b - 1);
+                }
+            };
+            println!("\n{dip_secs} dip seconds (rate < {threshold}/s)");
+            report("normal frames", &normal, nn);
+            report("dip frames", &dip, nd);
         }
         Cmd::Reset => {
             mach.reset()?;

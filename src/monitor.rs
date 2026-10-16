@@ -312,6 +312,37 @@ impl Monitor {
         Registers::parse(&text).ok_or_else(|| Error::Protocol(format!("could not parse step output: {text:?}")))
     }
 
+    /// Send a command and return its output as soon as the prompt arrives,
+    /// without the sync token or the settle time of [`Self::command`]. Only
+    /// for commands with short, well-terminated replies (`r`, `m`).
+    pub fn command_fast(&mut self, cmd: &str, timeout: Duration) -> Result<String> {
+        self.rx.clear();
+        self.write_raw(format!("{cmd}\r").as_bytes())?;
+        let raw = self.read_until(b"\n.", timeout)?;
+        let text = String::from_utf8_lossy(&raw[..raw.len() - 2]).replace('\r', "");
+        Ok(text)
+    }
+
+    /// Registers via the fast path (a few ms per call); used by the profiler.
+    pub fn registers_fast(&mut self) -> Result<Registers> {
+        let text = self.command_fast("r", Duration::from_secs(2))?;
+        Registers::parse(&text).ok_or_else(|| Error::Protocol(format!("could not parse registers: {text:?}")))
+    }
+
+    /// One byte via the fast path.
+    pub fn peek_fast(&mut self, addr: u32) -> Result<u8> {
+        let text = self.command_fast(&format!("m{addr:X}"), Duration::from_secs(2))?;
+        let want = format!(":{addr:08X}:");
+        for line in text.lines() {
+            if let Some(rest) = line.trim().strip_prefix(&want) {
+                if rest.len() >= 2 {
+                    return u8::from_str_radix(&rest[..2], 16).map_err(|_| Error::Protocol(format!("bad hex in {line:?}")));
+                }
+            }
+        }
+        Err(Error::Protocol(format!("no data for ${addr:X} in {text:?}")))
+    }
+
     pub fn registers(&mut self) -> Result<Registers> {
         let text = self.command("r")?;
         Registers::parse(&text).ok_or_else(|| Error::Protocol(format!("could not parse registers: {text:?}")))
