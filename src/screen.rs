@@ -90,7 +90,11 @@ impl VideoState {
             return Err(crate::Error::Other(format!("implausible screen geometry: {width}x{rows}, step {line_step}")));
         }
         let charset_size = if sixteen_bit && r[0x54] & 4 == 0 { 8192 * 8 } else { 2048 };
-        let y_scale = r[0x5b] as u32;
+        // Physical lines per glyph row: CHRYSCL+1, doubled when the VIC-III V400
+        // flag is set (measured on an R6: V400=0/CHRYSCL=1 and V400=1/CHRYSCL=0
+        // both give 16-line character rows).
+        let v400 = r[0x31] & 0x08 != 0;
+        let y_scale = (r[0x5b] as u32 + 1) * if v400 { 2 } else { 1 } - 1;
         let h640 = r[0x31] & 0x80 != 0;
         let mut x_step = r[0x5a] as f32 / 120.0;
         if !h640 {
@@ -114,7 +118,7 @@ impl VideoState {
             upper_case: r[0x18] & 2 == 0,
             pal: r[0x6f] & 0x80 == 0,
             h640,
-            v400: r[0x31] & 8 != 0,
+            v400,
             ebc: r[0x11] & 0x40 != 0,
             multicolour: r[0x16] & 0x10 != 0,
             bitmap: r[0x11] & 0x20 != 0,
