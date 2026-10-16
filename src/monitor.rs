@@ -66,14 +66,20 @@ pub struct Monitor {
     pub xemu: bool,
     /// Pace single bytes (old bitstreams without an RX FIFO, serial only).
     pace_writes: bool,
+    /// Upload with `l` without halting the CPU (the SD helper tolerates it and
+    /// can then write sectors while the next batch is uploaded).
+    pub load_without_halt: bool,
     pub debug: bool,
     /// Any unsolicited output (breakpoint/watch hits) seen while waiting for other things.
     pub events: Vec<String>,
+    /// Bytes that arrived ahead of whatever `read_until` was waiting for; the SD
+    /// helper's "FTBATCHDONE" can land here while an upload is in progress.
+    pub stray: Vec<u8>,
 }
 
 impl Monitor {
     pub fn new(t: Box<dyn Transport>) -> Self {
-        Self { t, rx: Vec::new(), rx_buffered: true, cpu_stopped: false, xemu: false, pace_writes: false, debug: false, events: Vec::new() }
+        Self { t, rx: Vec::new(), rx_buffered: true, cpu_stopped: false, xemu: false, pace_writes: false, debug: false, events: Vec::new(), stray: Vec::new(), load_without_halt: false }
     }
 
     /// Open the transport and synchronise with the monitor.
@@ -137,6 +143,9 @@ impl Monitor {
         }
         let junk = std::mem::take(&mut self.rx);
         self.note_events(&junk);
+        if self.stray.len() < 1 << 16 {
+            self.stray.extend_from_slice(&junk);
+        }
         Ok(())
     }
 
@@ -155,6 +164,9 @@ impl Monitor {
             if let Some(pos) = find(&self.rx, needle) {
                 let end = pos + needle.len();
                 let out: Vec<u8> = self.rx.drain(..end).collect();
+                if self.stray.len() < 1 << 16 {
+                    self.stray.extend_from_slice(&out[..pos]);
+                }
                 return Ok(out);
             }
             let now = Instant::now();
@@ -523,7 +535,7 @@ impl Monitor {
         }
         // The real monitor can't keep up at 2 Mbit/s with the CPU running; Xemu
         // doesn't care, and can't resume from a halt anyway.
-        let was_stopped = self.cpu_stopped || self.xemu;
+        let was_stopped = self.cpu_stopped || self.xemu || self.load_without_halt;
         if !was_stopped {
             self.stop_cpu()?;
         }

@@ -28,7 +28,8 @@ const SD_BUFFER: u32 = 0xffd6e00;
 /// The `remotesd` helper (GPL, from mega65-tools) as a C64 PRG with a `SYS 2061` stub.
 pub const REMOTESD_PRG: &[u8] = include_bytes!("../assets/remotesd.prg");
 const HELPER_JOBS: u32 = 0xc000;
-const HELPER_STAGING: u32 = 0x50000;
+/// Two 64 KB staging banks: one being written to the card while the other fills.
+const HELPER_STAGING: [u32; 2] = [0x50000, 0x40000];
 
 pub trait BlockDevice {
     fn read_sectors(&mut self, first: u32, count: usize) -> Result<Vec<u8>>;
@@ -137,6 +138,12 @@ pub struct HelperSd<'a> {
     /// Use SD multi-sector writes for runs of consecutive sectors
     /// (set `M65_SD_SINGLE_WRITES=1` to disable).
     pub multi_write: bool,
+    /// Which staging bank the next batch uses.
+    bank: usize,
+    /// A write batch the helper is still executing.
+    inflight: bool,
+    /// Pipeline uploads with card writes (`M65_SD_NO_PIPELINE=1` disables).
+    pub pipeline: bool,
 }
 
 impl<'a> HelperSd<'a> {
@@ -149,7 +156,7 @@ impl<'a> HelperSd<'a> {
         mon.write_raw(b"sc001 13\rsc000 1\r")?;
         let reply = mon.read_quiet(Duration::from_millis(200), Duration::from_millis(1500))?;
         if find(&reply, b"MEGA65FT1.0") {
-            return Ok(Self { mon: &mut mach.mon, pending_writes: BTreeMap::new(), multi_write: std::env::var_os("M65_SD_SINGLE_WRITES").is_none() });
+            return Ok(Self::wrap(&mut mach.mon));
         }
         mach.detect_mode(Duration::from_secs(10))?;
         if !force {
@@ -183,7 +190,7 @@ impl<'a> HelperSd<'a> {
         if !find(&reply, b"MEGA65FT1.0") {
             return Err(Error::Protocol("SD helper did not start".into()));
         }
-        Ok(Self { mon: &mut mach.mon, pending_writes: BTreeMap::new(), multi_write: std::env::var_os("M65_SD_SINGLE_WRITES").is_none() })
+        Ok(Self::wrap(&mut mach.mon))
     }
 
     /// Run a batch of jobs and collect any raw data they stream back.
@@ -191,6 +198,7 @@ impl<'a> HelperSd<'a> {
         if jobs.len() > 0xf00 {
             return Err(Error::Other("job batch too large".into()));
         }
+        self.wait_inflight()?;
         self.mon.write_memory(HELPER_JOBS + 1, jobs)?;
         self.mon.purge()?;
         self.mon.write_raw(format!("sc000 {njobs:x}\r").as_bytes())?;
@@ -243,9 +251,54 @@ impl<'a> HelperSd<'a> {
     }
 }
 
+impl<'a> HelperSd<'a> {
+    fn wrap(mon: &'a mut Monitor) -> Self {
+        let pipeline = std::env::var_os("M65_SD_NO_PIPELINE").is_none();
+        mon.load_without_halt = pipeline;
+        Self {
+            mon,
+            pending_writes: BTreeMap::new(),
+            multi_write: std::env::var_os("M65_SD_SINGLE_WRITES").is_none(),
+            bank: 0,
+            inflight: false,
+            pipeline,
+        }
+    }
+
+    /// Wait for the helper to finish the batch in flight, if any.
+    fn wait_inflight(&mut self) -> Result<()> {
+        if !self.inflight {
+            return Ok(());
+        }
+        self.inflight = false;
+        // It may have answered while an upload was being echoed.
+        if find(&self.mon.stray, b"FTBATCHDONE") {
+            self.mon.stray.clear();
+            return Ok(());
+        }
+        self.mon.stray.clear();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut raw: Vec<u8> = Vec::new();
+        loop {
+            let chunk = self.mon.read_quiet(Duration::from_millis(2), Duration::from_millis(50))?;
+            raw.extend_from_slice(&chunk);
+            if find(&raw, b"FTBATCHDONE") {
+                return Ok(());
+            }
+            if raw.len() > 4096 {
+                raw.drain(..2048);
+            }
+            if Instant::now() > deadline {
+                return Err(Error::Timeout("SD helper write batch".into()));
+            }
+        }
+    }
+}
+
 impl BlockDevice for HelperSd<'_> {
     fn read_sectors(&mut self, first: u32, count: usize) -> Result<Vec<u8>> {
         self.flush()?;
+        self.wait_inflight()?;
         let mut out = Vec::with_capacity(count * SECTOR);
         let mut s = first;
         let mut left = count;
@@ -292,7 +345,7 @@ impl BlockDevice for HelperSd<'_> {
             }
             for k in 0..run {
                 let (sector, data) = entries[i + k];
-                let addr = HELPER_STAGING + ((i + k) as u32) * SECTOR as u32;
+                let addr = HELPER_STAGING[0] + ((i + k) as u32) * SECTOR as u32;
                 staging.extend_from_slice(data);
                 let job = if multi && run >= 4 {
                     if k == 0 {
@@ -311,8 +364,28 @@ impl BlockDevice for HelperSd<'_> {
             }
             i += run;
         }
-        self.mon.write_memory(HELPER_STAGING, &staging)?;
-        self.execute(&jobs, writes.len(), 0)?;
+        let bank = self.bank;
+        let base = HELPER_STAGING[bank];
+        // Patch the staging addresses for the chosen bank.
+        for j in 0..writes.len() {
+            let addr = base + (j as u32) * SECTOR as u32;
+            jobs[j * 9 + 1..j * 9 + 5].copy_from_slice(&addr.to_le_bytes());
+        }
+        if self.pipeline {
+            // Upload while the previous batch is still being written, then wait
+            // for it before handing the helper the next job list.
+            self.mon.write_memory(base, &staging)?;
+            self.wait_inflight()?;
+            self.mon.write_memory(HELPER_JOBS + 1, &jobs)?;
+            self.mon.purge()?;
+            self.mon.stray.clear();
+            self.mon.write_raw(format!("sc000 {:x}\r", writes.len()).as_bytes())?;
+            self.inflight = true;
+            self.bank ^= 1;
+        } else {
+            self.mon.write_memory(base, &staging)?;
+            self.execute(&jobs, writes.len(), 0)?;
+        }
         Ok(())
     }
 
@@ -321,7 +394,8 @@ impl BlockDevice for HelperSd<'_> {
     }
 
     fn close(&mut self) -> Result<()> {
-        self.flush()
+        self.flush()?;
+        self.wait_inflight()
     }
 }
 
@@ -336,12 +410,14 @@ impl HelperSd<'_> {
                 v
             });
         }
-        self.flush()
+        self.flush()?;
+        self.wait_inflight()
     }
 
     /// Ask the helper to mount a D81 from the SD card root (helper job 0x12).
     pub fn mount_d81(&mut self, name: &str) -> Result<()> {
         self.flush()?;
+        self.wait_inflight()?;
         let mut job = vec![0x12u8];
         // The helper wants PETSCII: swap letter case.
         for b in name.bytes().take(63) {
@@ -355,6 +431,7 @@ impl HelperSd<'_> {
     /// Tell the helper to exit back to BASIC (job 0xFF).
     pub fn quit(&mut self) -> Result<()> {
         self.flush()?;
+        self.wait_inflight()?;
         self.mon.write_raw(b"sc001 ff\rsc000 1\r")?;
         std::thread::sleep(Duration::from_millis(100));
         Ok(())
