@@ -24,6 +24,10 @@ struct Cli {
     /// Serial speed in bits per second.
     #[arg(short = 's', long, global = true, default_value_t = transport::DEFAULT_BAUD, env = "M65_BAUD")]
     baud: u32,
+    /// Label file (VICE `al`, KickAssembler .label, ACME/64tass `name = $addr`, ca65 dbg)
+    /// so addresses can be given and shown as names.
+    #[arg(long, global = true, env = "M65_SYMBOLS")]
+    symbols: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -174,6 +178,19 @@ enum Cmd {
         #[arg(long, default_value_t = 4)]
         passes: usize,
     },
+    /// Decode a DMAgic job list at an address (on the machine, or in --file).
+    DmaList {
+        addr: String,
+        /// Read the list from a memory snapshot file instead of the machine.
+        #[arg(long)]
+        file: Option<String>,
+        /// Base address of the snapshot file.
+        #[arg(long, default_value = "0")]
+        file_addr: String,
+        /// Assume F018A 11-byte jobs when the list sets no format option.
+        #[arg(long)]
+        f018a: bool,
+    },
     /// Reset the MEGA65.
     Reset,
     /// Send a raw monitor command and print the reply.
@@ -306,8 +323,16 @@ fn connect(cli: &Cli) -> anyhow::Result<Monitor> {
     Monitor::connect(&dev, cli.baud).with_context(|| format!("connecting to {dev}"))
 }
 
+fn load_symbols(cli: &Cli) -> anyhow::Result<mega65::symbols::SymbolTable> {
+    match &cli.symbols {
+        Some(p) => Ok(mega65::symbols::SymbolTable::load(std::path::Path::new(p))?),
+        None => Ok(Default::default()),
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    let syms = load_symbols(&cli)?;
     match &cli.cmd {
         Cmd::Ports => {
             println!("Serial ports:");
@@ -332,23 +357,36 @@ fn main() -> anyhow::Result<()> {
                 Some(a) => (parse_hex(a).map_err(anyhow::Error::msg)?, &bytes[..]),
                 None => (u16::from_le_bytes([bytes[0], bytes[1]]) as u32, &bytes[2..]),
             };
-            let start = match from { Some(f) => parse_hex(f).map_err(anyhow::Error::msg)?, None => base };
+            let start = match from { Some(f) => syms.resolve(f).map_err(anyhow::Error::msg)?, None => base };
             let off = (start - base) as usize;
             for i in mega65::disasm::disassemble(start, &data[off.min(data.len())..]) {
-                println!("{}", i.format(false));
+                for n in syms.names_at(i.addr & 0xffff) {
+                    println!("{n}:");
+                }
+                println!("{}", i.format_with(false, Some(&syms)));
             }
+            Ok(())
+        }
+        Cmd::DmaList { addr, file: Some(f), file_addr, f018a } => {
+            let bytes = std::fs::read(f)?;
+            let base = parse_hex(file_addr).map_err(anyhow::Error::msg)?;
+            let a = syms.resolve(addr).map_err(anyhow::Error::msg)?;
+            let off = (a - base) as usize;
+            let l = mega65::dma::decode(&bytes[off.min(bytes.len())..], !f018a);
+            print!("{}", l.describe(a));
             Ok(())
         }
         Cmd::Sd(s) => sd_cmd(&cli, s),
         _ => {
             let mon = connect(&cli)?;
-            run(cli.cmd, Machine::new(mon))
+            run(cli.cmd, Machine::new(mon), &syms)
         }
     }
 }
 
-fn run(cmd: Cmd, mut mach: Machine) -> anyhow::Result<()> {
-    let hx = |s: &str| parse_hex(s).map_err(anyhow::Error::msg);
+fn run(cmd: Cmd, mut mach: Machine, syms: &mega65::symbols::SymbolTable) -> anyhow::Result<()> {
+    // Addresses may be symbols when a label file is loaded.
+    let hx = |s: &str| syms.resolve(s).map_err(anyhow::Error::msg);
     match cmd {
         Cmd::Info => {
             println!("connected to {}", mach.mon.describe());
@@ -464,11 +502,14 @@ fn run(cmd: Cmd, mut mach: Machine) -> anyhow::Result<()> {
         }
         Cmd::Dis { addr, pages, local } => {
             let mut a = hx(&addr)?;
-            if local || mach.mon.xemu {
+            if local || mach.mon.xemu || !syms.is_empty() {
                 let mem = mach.mon.read_memory(a, 48 * pages)?;
                 let wide = a >= 0x10000 && (a & 0xfff0000) != 0x7770000;
                 for i in mega65::disasm::disassemble(a, &mem) {
-                    println!("{}", i.format(wide));
+                    for n in syms.names_at(i.addr & 0xffff) {
+                        println!("{n}:");
+                    }
+                    println!("{}", i.format_with(wide, Some(syms)));
                 }
                 return Ok(());
             }
@@ -502,7 +543,8 @@ fn run(cmd: Cmd, mut mach: Machine) -> anyhow::Result<()> {
             println!(" share   samples  address");
             let mut shown = 0u32;
             for (a, c) in v.iter().take(top) {
-                println!("{:5.1}%  {:8}  ${:04X}-${:04X}", *c as f64 * 100.0 / n as f64, c, a, a + bucket.max(1) - 1);
+                let lab = syms.label(*a, 0x400).map(|l| format!("  {l}")).unwrap_or_default();
+                println!("{:5.1}%  {:8}  ${:04X}-${:04X}{lab}", *c as f64 * 100.0 / n as f64, c, a, a + bucket.max(1) - 1);
                 shown += c;
             }
             println!("{:5.1}%  {:8}  (everything else)", (n - shown) as f64 * 100.0 / n as f64, n - shown);
@@ -601,6 +643,11 @@ fn run(cmd: Cmd, mut mach: Machine) -> anyhow::Result<()> {
                 println!("{}", c.describe());
             }
         }
+        Cmd::DmaList { addr, file: None, f018a, .. } => {
+            let a = hx(&addr)?;
+            let bytes = mach.mon.read_memory(a, 512)?;
+            print!("{}", mega65::dma::decode(&bytes, !f018a).describe(a));
+        }
         Cmd::Reset => {
             mach.reset()?;
             println!("reset");
@@ -649,7 +696,7 @@ fn run(cmd: Cmd, mut mach: Machine) -> anyhow::Result<()> {
             println!("{} reads, {} writes", vf.reads, vf.writes);
             r?;
         }
-        Cmd::Ports | Cmd::Sd(_) | Cmd::Jtag(_) | Cmd::DisasmFile { .. } => unreachable!(),
+        Cmd::Ports | Cmd::Sd(_) | Cmd::Jtag(_) | Cmd::DisasmFile { .. } | Cmd::DmaList { file: Some(_), .. } => unreachable!(),
     }
     Ok(())
 }

@@ -79,6 +79,9 @@ pub struct Instruction {
     pub bytes: Vec<u8>,
     pub mnemonic: String,
     pub operand: String,
+    /// Absolute 16-bit address the operand refers to (absolute, indexed,
+    /// indirect and branch targets), for symbol annotation.
+    pub target: Option<u16>,
 }
 
 impl Instruction {
@@ -92,9 +95,21 @@ impl Instruction {
 
     /// `$2001  A9 00     LDA  #$00`
     pub fn format(&self, wide_addr: bool) -> String {
+        self.format_with(wide_addr, None)
+    }
+
+    /// Like [`Self::format`], with a `; name+off` comment for operand targets
+    /// that have a symbol, when a table is given.
+    pub fn format_with(&self, wide_addr: bool, symbols: Option<&crate::symbols::SymbolTable>) -> String {
         let hex: Vec<String> = self.bytes.iter().map(|b| format!("{b:02X}")).collect();
         let addr = if wide_addr { format!("${:07X}", self.addr) } else { format!("${:04X}", self.addr & 0xffff) };
-        format!("{addr}  {:<12} {:<5}{}", hex.join(" "), self.mnemonic, self.operand)
+        let mut s = format!("{addr}  {:<12} {:<5}{}", hex.join(" "), self.mnemonic, self.operand);
+        if let (Some(t), Some(sym)) = (self.target, symbols) {
+            if let Some(l) = sym.label(t as u32, 8) {
+                s = format!("{s:<40} ; {l}");
+            }
+        }
+        s
     }
 }
 
@@ -162,7 +177,15 @@ pub fn decode(addr: u32, mem: &[u8]) -> Option<Instruction> {
         Mode::ImmNnnn => format!("#${b2:02X}{b1:02X}"),
     };
     let mnemonic = if quad { q_form(name).unwrap_or_else(|| name.to_string()) } else { name.to_string() };
-    Some(Instruction { addr, bytes: mem[..need].to_vec(), mnemonic, operand })
+    let abs = ((b2 as u16) << 8) | b1 as u16;
+    let target = match mode {
+        Mode::Nnnn | Mode::NnnnX | Mode::NnnnY | Mode::Innnn | Mode::InnnnX => Some(abs),
+        Mode::Rr => Some(((pc + 2).wrapping_add(b1 as i8 as i32 as u32) & 0xffff) as u16),
+        Mode::Rrrr => Some(((pc + 2).wrapping_add(abs as i16 as i32 as u32) & 0xffff) as u16),
+        Mode::NnRr => Some(((pc + 3).wrapping_add(b2 as i8 as i32 as u32) & 0xffff) as u16),
+        _ => None,
+    };
+    Some(Instruction { addr, bytes: mem[..need].to_vec(), mnemonic, operand, target })
 }
 
 /// Disassemble as many instructions as fit in `mem`.

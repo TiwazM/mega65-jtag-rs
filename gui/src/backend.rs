@@ -50,6 +50,10 @@ pub enum Cmd {
     ProfilerReset,
     /// Scan memory for bytes that change once per frame.
     FindFrameFlag,
+    /// Use this symbol table for disassembly annotations.
+    Symbols(std::sync::Arc<mega65::symbols::SymbolTable>),
+    /// Decode the DMA list at an address.
+    DmaList { addr: u32 },
     Shutdown,
 }
 
@@ -72,6 +76,7 @@ pub enum Event {
     /// Progress of a long operation, (done, total), or None when finished.
     Progress(Option<(usize, usize)>),
     FrameFlagCandidates(Vec<mega65::probe::FlagCandidate>),
+    DmaList { addr: u32, text: String },
 }
 
 pub struct Backend {
@@ -123,6 +128,7 @@ struct Worker {
     prof_bucket: u32,
     prof_hist: std::collections::HashMap<u32, u32>,
     prof_total: u32,
+    symbols: std::sync::Arc<mega65::symbols::SymbolTable>,
 }
 
 impl Worker {
@@ -145,6 +151,7 @@ impl Worker {
             prof_bucket: 16,
             prof_hist: Default::default(),
             prof_total: 0,
+            symbols: Default::default(),
         }
     }
 
@@ -372,6 +379,15 @@ impl Worker {
                 self.emit(Event::FrameFlagCandidates(r?));
                 self.prof_on = was;
             }
+            Cmd::Symbols(t) => {
+                self.symbols = t;
+                self.refresh_disasm()?;
+            }
+            Cmd::DmaList { addr } => {
+                let bytes = self.mach()?.mon.read_memory(addr, 512)?;
+                let text = mega65::dma::decode(&bytes, true).describe(addr);
+                self.emit(Event::DmaList { addr, text });
+            }
             Cmd::ProfilerReset => {
                 self.prof_hist.clear();
                 self.prof_total = 0;
@@ -500,7 +516,16 @@ impl Worker {
         let len = 48 * pages.max(1);
         let mem = m.mon.read_memory(start, len)?;
         let wide = start >= 0x10000 && (start & 0xfff0000) != 0x7770000;
-        let text: String = mega65::disasm::disassemble(start, &mem).iter().map(|i| i.format(wide) + "\n").collect();
+        let syms = self.symbols.clone();
+        let mut text = String::new();
+        for i in mega65::disasm::disassemble(start, &mem) {
+            for n in syms.names_at(i.addr & 0xffff) {
+                text.push_str(n);
+                text.push_str(":\n");
+            }
+            text.push_str(&i.format_with(wide, Some(&syms)));
+            text.push('\n');
+        }
         self.emit(Event::Disasm { addr: start, text });
         Ok(())
     }

@@ -34,6 +34,8 @@ struct Settings {
     tab: Tab,
     prof_flag: String,
     prof_bucket: u32,
+    symbols_path: String,
+    dma_addr: String,
 }
 
 impl Default for Settings {
@@ -55,6 +57,8 @@ impl Default for Settings {
             tab: Tab::Memory,
             prof_flag: String::new(),
             prof_bucket: 16,
+            symbols_path: String::new(),
+            dma_addr: String::new(),
         }
     }
 }
@@ -65,6 +69,7 @@ enum Tab {
     Disassembly,
     Screen,
     Profiler,
+    Dma,
     Console,
 }
 
@@ -109,6 +114,8 @@ pub struct StudioApp {
     fps_history: VecDeque<f32>,
     progress: Option<(usize, usize)>,
     flag_candidates: Vec<mega65::probe::FlagCandidate>,
+    symbols: std::sync::Arc<mega65::symbols::SymbolTable>,
+    dma_text: String,
 }
 
 impl StudioApp {
@@ -117,7 +124,7 @@ impl StudioApp {
         let backend = Backend::start(cc.egui_ctx.clone());
         backend.send(Cmd::SetLive { enabled: s.live, interval: Duration::from_millis(s.interval_ms), screen: s.live_screen });
         let ports = transport::list_ports().into_iter().map(|p| p.path).collect();
-        Self {
+        let mut app = Self {
             backend,
             s,
             connected: false,
@@ -150,8 +157,44 @@ impl StudioApp {
             fps_history: VecDeque::new(),
             progress: None,
             flag_candidates: Vec::new(),
+            symbols: Default::default(),
+            dma_text: String::new(),
+        };
+        if !app.s.symbols_path.is_empty() {
+            app.load_symbols(std::path::PathBuf::from(app.s.symbols_path.clone()));
+        }
+        app
+    }
+
+    fn load_symbols(&mut self, path: PathBuf) {
+        match mega65::symbols::SymbolTable::load(&path) {
+            Ok(t) => {
+                self.push_log(format!("loaded {} symbols from {}", t.len(), path.display()));
+                self.s.symbols_path = path.display().to_string();
+                self.symbols = std::sync::Arc::new(t);
+                self.backend.send(Cmd::Symbols(self.symbols.clone()));
+            }
+            Err(e) => self.last_error = Some(e.to_string()),
         }
     }
+
+    /// Try `<prg stem>.sym` / `.vs` / `.lbl` / `.labels` / `.dbg` next to a PRG.
+    fn auto_symbols_for(&mut self, prg: &std::path::Path) {
+        for ext in ["sym", "vs", "lbl", "labels", "dbg", "map"] {
+            let p = prg.with_extension(ext);
+            if p.exists() {
+                self.load_symbols(p);
+                return;
+            }
+        }
+    }
+
+    /// Parse an address that may be a symbol name.
+    fn addr(&self, s: &str) -> Result<u32, String> {
+        self.symbols.resolve(s)
+    }
+
+
 
     fn push_log(&mut self, line: String) {
         for l in line.lines() {
@@ -226,6 +269,7 @@ impl StudioApp {
                     }
                 }
                 Event::Progress(p) => self.progress = p,
+                Event::DmaList { addr, text } => self.dma_text = format!("DMA list at ${addr:07X}\n{text}"),
                 Event::FrameFlagCandidates(v) => {
                     self.push_log(format!("frame flag scan: {} candidates", v.len()));
                     self.flag_candidates = v;
@@ -241,11 +285,11 @@ impl StudioApp {
 
     fn send_views(&self) {
         for (i, a) in self.s.mem_addr.iter().enumerate() {
-            if let Ok(addr) = parse_hex(a) {
+            if let Ok(addr) = self.symbols.resolve(a) {
                 self.backend.send(Cmd::Memory { id: i, addr, len: self.s.mem_rows * 16 });
             }
         }
-        let addr = if self.s.disasm_follow { None } else { parse_hex(&self.s.disasm_addr).ok() };
+        let addr = if self.s.disasm_follow { None } else { self.symbols.resolve(&self.s.disasm_addr).ok() };
         self.backend.send(Cmd::Disasm { addr, pages: 2 });
     }
 
@@ -313,6 +357,13 @@ impl StudioApp {
             if ui.add(egui::DragValue::new(&mut self.s.interval_ms).range(100..=5000).suffix(" ms")).changed() {
                 self.send_live();
             }
+            ui.separator();
+            let sym_label = if self.symbols.is_empty() { "Symbols…".to_string() } else { format!("Symbols ({})", self.symbols.len()) };
+            if ui.button(sym_label).on_hover_text("load a label file: VICE al, KickAssembler .label, ACME/64tass name = $addr, ca65 dbg").clicked() {
+                if let Some(p) = rfd::FileDialog::new().add_filter("label files", &["sym", "vs", "lbl", "labels", "dbg", "map", "txt"]).pick_file() {
+                    self.load_symbols(p);
+                }
+            }
             if self.busy {
                 ui.spinner();
             }
@@ -356,7 +407,7 @@ impl StudioApp {
         ui.horizontal(|ui| {
             ui.add(egui::TextEdit::singleline(&mut self.break_in).desired_width(70.0).hint_text("PC hex"));
             if ui.add_enabled(en, egui::Button::new("Set")).clicked() {
-                match parse_hex(&self.break_in) {
+                match self.addr(&self.break_in) {
                     Ok(a) => self.backend.send(Cmd::SetBreak(Some(a as u16))),
                     Err(e) => self.last_error = Some(e),
                 }
@@ -369,7 +420,7 @@ impl StudioApp {
         ui.horizontal(|ui| {
             ui.add(egui::TextEdit::singleline(&mut self.watch_in).desired_width(70.0).hint_text("28-bit hex"));
             if ui.add_enabled(en, egui::Button::new("Set")).clicked() {
-                match parse_hex(&self.watch_in) {
+                match self.addr(&self.watch_in) {
                     Ok(a) => self.backend.send(Cmd::SetWatch(Some(a))),
                     Err(e) => self.last_error = Some(e),
                 }
@@ -381,7 +432,7 @@ impl StudioApp {
         ui.horizontal(|ui| {
             ui.add(egui::TextEdit::singleline(&mut self.goto_in).desired_width(70.0).hint_text("PC hex"));
             if ui.add_enabled(en, egui::Button::new("Go to")).on_hover_text("set PC and run").clicked() {
-                match parse_hex(&self.goto_in) {
+                match self.addr(&self.goto_in) {
                     Ok(a) => self.backend.send(Cmd::GoTo(a as u16)),
                     Err(e) => self.last_error = Some(e),
                 }
@@ -409,7 +460,9 @@ impl StudioApp {
         });
         ui.horizontal(|ui| {
             if ui.add_enabled(en && !self.s.prg_path.is_empty(), egui::Button::new("Load PRG")).clicked() {
-                self.backend.send(Cmd::LoadPrg { path: PathBuf::from(&self.s.prg_path), run: self.s.prg_run, binary: self.s.prg_binary, jump: None });
+                let p = PathBuf::from(&self.s.prg_path);
+                self.auto_symbols_for(&p);
+                self.backend.send(Cmd::LoadPrg { path: p, run: self.s.prg_run, binary: self.s.prg_binary, jump: None });
             }
             ui.add(egui::TextEdit::singleline(&mut self.bin_addr).desired_width(60.0).hint_text("addr"));
             if ui.add_enabled(en && !self.s.prg_path.is_empty(), egui::Button::new("Load raw at")).on_hover_text("write the file as-is at this 28-bit address (ROM areas are unprotected first)").clicked() {
@@ -692,7 +745,10 @@ impl StudioApp {
                     let share = *count as f32 * 100.0 / total;
                     ui.label(RichText::new(format!("{share:5.1}%")).monospace());
                     ui.label(RichText::new(format!("{count}")).monospace());
-                    let range = if self.s.prof_bucket > 1 { format!("${addr:04X}-${:04X}", addr + self.s.prof_bucket - 1) } else { format!("${addr:04X}") };
+                    let mut range = if self.s.prof_bucket > 1 { format!("${addr:04X}-${:04X}", addr + self.s.prof_bucket - 1) } else { format!("${addr:04X}") };
+                    if let Some(l) = self.symbols.label(*addr, 0x400) {
+                        range.push_str(&format!("  {l}"));
+                    }
                     if ui.add(egui::Label::new(RichText::new(range).monospace()).sense(egui::Sense::click())).clicked() {
                         goto = Some(*addr);
                     }
@@ -709,6 +765,24 @@ impl StudioApp {
             self.s.tab = Tab::Disassembly;
             self.send_views();
         }
+    }
+
+    fn dma_tab(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("DMA list at:");
+            let r = ui.add(egui::TextEdit::singleline(&mut self.s.dma_addr).desired_width(120.0).hint_text("hex address or symbol"));
+            let go = ui.add_enabled(self.connected, egui::Button::new("Decode")).clicked() || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+            if go && self.connected {
+                match self.addr(&self.s.dma_addr) {
+                    Ok(a) => self.backend.send(Cmd::DmaList { addr: a }),
+                    Err(e) => self.last_error = Some(e),
+                }
+            }
+            ui.label(RichText::new("the address a program writes to $D700/$D701/$D702 (or $D705); chained lists are followed").weak().small());
+        });
+        egui::ScrollArea::both().show(ui, |ui| {
+            ui.label(RichText::new(&self.dma_text).monospace());
+        });
     }
 
     fn console_tab(&mut self, ui: &mut egui::Ui) {
@@ -769,6 +843,7 @@ impl eframe::App for StudioApp {
                 ui.selectable_value(&mut self.s.tab, Tab::Disassembly, "Disassembly");
                 ui.selectable_value(&mut self.s.tab, Tab::Screen, "Screen");
                 ui.selectable_value(&mut self.s.tab, Tab::Profiler, if self.prof_on { "Profiler ●" } else { "Profiler" });
+                ui.selectable_value(&mut self.s.tab, Tab::Dma, "DMA");
                 ui.selectable_value(&mut self.s.tab, Tab::Console, "Console / Log");
             });
             ui.separator();
@@ -777,6 +852,7 @@ impl eframe::App for StudioApp {
                 Tab::Disassembly => self.disasm_tab(ui),
                 Tab::Screen => self.screen_tab(ui),
                 Tab::Profiler => self.profiler_tab(ui),
+                Tab::Dma => self.dma_tab(ui),
                 Tab::Console => self.console_tab(ui),
             }
         });

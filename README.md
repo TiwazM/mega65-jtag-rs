@@ -40,6 +40,8 @@ current banking, e.g. `777080d`):
 | `sample ADDR [SECS]` / `fps-profile ADDR [SECS]` | how often a byte changes (a per-frame flag gives the fps); fps-profile also bins PC samples into normal vs dip seconds |
 | `disasm-file FILE [--addr A] [--from A]` | disassemble a PRG or memory snapshot on the host |
 | `find-flag` | scan memory for bytes that change once per frame (frame counters, flip flags) to feed `sample`/`fps-profile`/the profiler |
+| `dma-list ADDR [--file SNAPSHOT]` | decode a DMAgic job list: option bytes, F018A/B jobs, chained lists, byte totals |
+| `--symbols FILE` (global) | label file (VICE `al`, KickAssembler `.label`, ACME/64tass `name = $addr`, ca65 dbg); addresses can then be names, and `dis`/`disasm-file`/`profile` show them |
 
 Screen and input:
 
@@ -68,7 +70,8 @@ the flashed core back. The bitstream's IDCODE is checked against the FPGA first.
 `cargo run --release -p m65-studio` opens a debugger-style window (egui, so it
 builds the same on macOS, Windows and Linux):
 
-- toolbar: device/baud, Connect, Stop / Go / Step N, Refresh, Reset, live polling interval;
+- toolbar: device/baud, Connect, Stop / Go / Step N, Refresh, Reset, live polling interval,
+  Symbols… (label file; also auto-loaded from `<prg>.sym`/`.vs`/`.lbl`/`.dbg` next to a loaded PRG);
 - sidebar: registers and flags, breakpoint, watchpoint, go-to, IRQ on/off, PRG
   loader (Browse or drag a file onto the window), memory save, virtual keyboard,
   GO64 / PAL / NTSC;
@@ -76,7 +79,9 @@ builds the same on macOS, Windows and Linux):
   follows PC, screen capture (optionally on every poll, save as PNG), a
   profiler (continuous PC sampling without stopping the CPU: hot-address table
   with click-to-disassemble, and a frame-rate graph from any byte that changes
-  once per rendered frame), and a console for raw monitor commands with the log.
+  once per rendered frame, with a Find… button that locates such bytes), a DMA
+  list decoder, and a console for raw monitor commands with the log. Addresses
+  typed anywhere may be symbol names, and disassembly shows labels.
 
 All hardware traffic runs on one worker thread, so the UI never blocks and
 panels can't interleave commands. Settings persist between runs.

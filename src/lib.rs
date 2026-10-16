@@ -13,6 +13,7 @@
 //! * [`jtag`] talks to the FPGA directly through FTDI MPSSE (IDCODE, bitstream load).
 
 pub mod disasm;
+pub mod dma;
 pub mod fat32;
 pub mod jtag;
 pub mod machine;
@@ -20,6 +21,7 @@ pub mod monitor;
 pub mod petscii;
 pub mod probe;
 pub mod screen;
+pub mod symbols;
 pub mod sdcard;
 pub mod transport;
 pub mod vf011;
