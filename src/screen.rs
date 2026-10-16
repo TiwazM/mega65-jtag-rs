@@ -256,8 +256,23 @@ impl VideoState {
                 break;
             }
             let mut x_pos = self.chargen_x;
+            // GOTOX tokens set these for the characters that follow them.
+            let mut transparent_bg = false;
+            let mut fcm_yoffs: i32 = 0;
+            let px_per_vic2 = if self.h640 { 1 } else { 2 };
             for cx in 0..self.width {
                 let (ch, col) = self.cell(cx, cy);
+                if col & 0x1000 != 0 {
+                    // GOTOX: 10-bit signed X in VIC-II pixels, relative to the
+                    // start of character drawing; transparent flag; FCM Y offset.
+                    let raw = (ch & 0x3ff) as i32;
+                    let gx = if raw & 0x200 != 0 { raw - 0x400 } else { raw };
+                    x_pos = self.chargen_x + gx * px_per_vic2;
+                    transparent_bg = col & 0x8000 != 0;
+                    let yo = ((ch >> 13) & 7) as i32;
+                    fcm_yoffs = if ch & 0x1000 != 0 { -yo } else { yo };
+                    continue;
+                }
                 let mut background = self.background;
                 let char_id = if self.ebc {
                     background = self.regs[0x21 + ((ch >> 6) & 3) as usize];
@@ -270,7 +285,6 @@ impl VideoState {
                 let flip_v = col & 0x8000 != 0;
                 let flip_h = col & 0x4000 != 0;
                 let with_alpha = col & 0x2000 != 0;
-                let goto = col & 0x1000 != 0;
                 let (mut bold, mut reverse, mut underline) = (false, false, false);
                 if self.viciii_attribs && !self.multicolour {
                     reverse = col & 0x20 != 0;
@@ -302,7 +316,7 @@ impl VideoState {
                     let row = if flip_v { 7 - yy } else { yy } as usize;
                     let mut g = [0u8; 8];
                     if full_colour {
-                        let addr = char_id as u32 * 64 + row as u32 * 8;
+                        let addr = (char_id as i64 * 64 + (row as i64 + fcm_yoffs as i64) * 8).max(0) as u32;
                         let base = addr & !0xff;
                         if !fcm_cache.contains_key(&base) {
                             fcm_cache.insert(base, mon.read_memory(base, 256)?);
@@ -341,10 +355,6 @@ impl VideoState {
                         g = [0xff; 8];
                     }
                     xc = 0;
-                    if goto {
-                        x_pos = self.chargen_x + (ch & 0x3ff) as i32;
-                        continue;
-                    }
                     let mut xx = 0f32;
                     while xx < glyph_width as f32 {
                         let xi = xx as usize;
@@ -381,6 +391,7 @@ impl VideoState {
                                 is_fg = fg != 0;
                             } else {
                                 c = self.rgb(g[xi], alt);
+                                is_fg = g[xi] != 0;
                             }
                         } else if self.multicolour && (fg & 8 != 0 || self.bitmap) {
                             let mut bits = 0;
@@ -428,7 +439,11 @@ impl VideoState {
                             c = self.rgb(fg, alt);
                             is_fg = true;
                         }
-                        let _ = is_fg;
+                        if transparent_bg && !is_fg {
+                            xc += 1;
+                            xx += self.x_step;
+                            continue;
+                        }
                         for yc in 0..=self.y_scale as i32 {
                             let py = y_pos + yc + yy * (1 + self.y_scale as i32);
                             let px = x_pos + xc;
