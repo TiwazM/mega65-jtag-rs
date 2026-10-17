@@ -18,6 +18,7 @@ pub mod dma;
 pub mod fat32;
 pub mod jtag;
 pub mod machine;
+pub mod memsearch;
 pub mod monitor;
 pub mod petscii;
 pub mod probe;

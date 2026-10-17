@@ -41,6 +41,7 @@ current banking, e.g. `777080d`):
 | `disasm-file FILE [--addr A] [--from A]` | disassemble a PRG or memory snapshot on the host |
 | `find-flag` | scan memory for bytes that change once per frame (frame counters, flip flags) to feed `sample`/`fps-profile`/the profiler |
 | `dma-list ADDR [--file SNAPSHOT]` | decode a DMAgic job list: option bytes, F018A/B jobs, chained lists, byte totals |
+| `search [STEPS…] [--start A --end A] [--word]` | Action Replay-style memory search: find a game variable by value, then narrow the list as it changes (see below) |
 | `--symbols FILE` (global) | label file (VICE `al`, KickAssembler `.label`, ACME/64tass `name = $addr`, ca65 dbg); addresses can then be names, and `dis`/`disasm-file`/`profile` show them |
 
 Screen and input:
@@ -64,6 +65,43 @@ JTAG (`m65rs jtag ...`): `list`, `idcode`, `bitinfo FILE.bit`, and
 `bit FILE.bit [--desync]` to configure the FPGA from a bitstream. That is
 volatile: the cores in flash are never written, and the next power cycle brings
 the flashed core back. The bitstream's IDCODE is checked against the FPGA first.
+
+## Memory search (finding game variables)
+
+`m65rs search` and Studio's Search tab work like the Action Replay cartridge's
+"search": take a snapshot of a memory range, play, then keep only the
+addresses whose value changed the way you say, until a handful are left.
+
+```
+$ m65rs search
+searching $0000000-$0010000 as bytes. Type a value to start (or ? for unknown), then play and type +, -, =, ! to narrow; list, reset, quit.
+search> 3          # lives shown on screen
+= 3 ($3): 1532 addresses match
+search> =          # a moment later, no life lost: unchanged
+unchanged: 412 addresses match
+search> 2          # lost a life
+= 2 ($2): 1 address match
+  $00074D2    2 ($02)   was   3 ($03)
+```
+
+Filters: a number (`5`, `=$10`) keeps addresses equal to it, `!=5` not equal,
+`?` keeps everything (unknown start), `+`/`-` increased/decreased, `+3`/`-3`
+up/down by exactly that much, `=` unchanged, `!` changed. `list`, `history`,
+`reset` and `quit` do what they say. `--start`/`--end` pick the range (28-bit:
+chip RAM is `0`-`60000`, attic RAM starts at `8000000`, colour RAM at
+`FF80000`), `--word` compares little-endian words. Filters given on the
+command line run before the prompt; on the ai-agent Xemu build `--frames N`
+runs N frames between them, so `m65rs search ? + + + --frames 30` lists every
+counter in one go.
+
+The CPU is never stopped and nothing is written: the first snapshot reads the
+whole range (64 KB in about half a second on the real machine; a snapshot is
+not one instant, but a value caught mid-change is sorted out by the next step)
+and later steps read only the survivors' neighbourhoods, so they are a few
+monitor round trips. Studio's Search tab has the same filters as buttons, a
+range picker (chip RAM, colour RAM, attic RAM or a custom range), byte/word,
+and `→ Watch` on every hit, which adds it to the Watches tab where the value
+can be edited. Scores are often BCD: 1250 is the bytes `$12 $50`.
 
 ## Sending BASIC source
 
@@ -139,7 +177,9 @@ builds the same on macOS, Windows and Linux):
   with click-to-disassemble, and a frame-rate graph from any byte that changes
   once per rendered frame, with a Find… button that locates such bytes), a
   watch list (named bytes/words that refresh on every poll, flash on change,
-  show a changes-per-second figure and can be edited in place), a DMA list
+  show a changes-per-second figure and can be edited in place), a Search tab
+  (Action Replay-style value search, see above; hits go to the watch list with
+  one click), a DMA list
   decoder, a BASIC tab (pick or drop a `.bas`/`.txt` file, see the listing
   as the MEGA65 will show it with any errors or fixes, then Send BASIC, with
   optional RUN and DSAVE, a progress bar, and the read-back check; the file is

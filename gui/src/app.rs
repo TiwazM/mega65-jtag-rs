@@ -47,6 +47,12 @@ struct Settings {
     basic_save_name: String,
     basic_auto_start: u16,
     basic_auto_step: u16,
+    /// Index into `mega65::memsearch::PRESETS`, or PRESETS.len() for a custom range.
+    search_preset: usize,
+    search_start: String,
+    search_end: String,
+    search_width: u8,
+    search_value: String,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -89,6 +95,11 @@ impl Default for Settings {
             basic_save_name: String::new(),
             basic_auto_start: 10,
             basic_auto_step: 10,
+            search_preset: 0,
+            search_start: "2000".into(),
+            search_end: "10000".into(),
+            search_width: 1,
+            search_value: String::new(),
         }
     }
 }
@@ -100,9 +111,20 @@ enum Tab {
     Screen,
     Profiler,
     Watches,
+    Search,
     Dma,
     Basic,
     Console,
+}
+
+/// The Search tab: the last result of the backend's memory search.
+#[derive(Default)]
+struct SearchState {
+    started: bool,
+    count: usize,
+    hits: Vec<mega65::memsearch::Hit>,
+    width: u8,
+    history: Vec<String>,
 }
 
 #[derive(Default)]
@@ -153,6 +175,7 @@ pub struct StudioApp {
     watch_new: (String, String, u8),
     watch_edit: Option<(usize, String)>,
     basic: BasicState,
+    search: SearchState,
 }
 
 /// The BASIC tab: the loaded source, its tokenized preview and the last send.
@@ -225,6 +248,7 @@ impl StudioApp {
             watch_new: (String::new(), String::new(), 1),
             watch_edit: None,
             basic: BasicState::default(),
+            search: SearchState::default(),
         };
         app.watch_vals = vec![WatchState::default(); app.s.watches.len()];
         if !app.s.basic_path.is_empty() {
@@ -368,6 +392,13 @@ impl StudioApp {
                         self.last_error = Some(e.lines().next().unwrap_or("").to_string());
                     }
                     self.basic.result = Some(r);
+                }
+                Event::Search { count, hits, width, history } => {
+                    self.search.started = !history.is_empty();
+                    self.search.count = count;
+                    self.search.hits = hits;
+                    self.search.width = width;
+                    self.search.history = history;
                 }
                 Event::FrameFlagCandidates(v) => {
                     self.push_log(format!("frame flag scan: {} candidates", v.len()));
@@ -1003,6 +1034,184 @@ impl StudioApp {
         }
     }
 
+    /// The memory range the Search tab is set to, as (start, len) regions.
+    fn search_regions(&self) -> Result<Vec<(u32, usize)>, String> {
+        use mega65::memsearch::PRESETS;
+        if let Some(&(_, start, len)) = PRESETS.get(self.s.search_preset) {
+            return Ok(vec![(start, len)]);
+        }
+        let s = self.addr(&self.s.search_start)?;
+        let e = self.addr(&self.s.search_end)?;
+        if e <= s {
+            return Err("the end of the range must be after its start".into());
+        }
+        Ok(vec![(s, (e - s) as usize)])
+    }
+
+    fn search_step(&mut self, filter: mega65::memsearch::Filter, fresh: bool) {
+        let start = if fresh || !self.search.started {
+            match self.search_regions() {
+                Ok(r) => Some((r, self.s.search_width)),
+                Err(e) => {
+                    self.last_error = Some(e);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        self.last_error = None;
+        self.backend.send(Cmd::SearchStep { filter, start });
+    }
+
+    fn search_tab(&mut self, ui: &mut egui::Ui) {
+        use mega65::memsearch::{Filter, PRESETS};
+        let en = self.connected && self.progress.is_none();
+        let started = self.search.started;
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Where:");
+            let name = |i: usize| PRESETS.get(i).map(|p| p.0.to_string()).unwrap_or_else(|| "Custom range".into());
+            egui::ComboBox::from_id_salt("search_preset").selected_text(name(self.s.search_preset)).show_ui(ui, |ui| {
+                for i in 0..=PRESETS.len() {
+                    ui.selectable_value(&mut self.s.search_preset, i, name(i));
+                }
+            });
+            if self.s.search_preset >= PRESETS.len() {
+                ui.add(egui::TextEdit::singleline(&mut self.s.search_start).desired_width(80.0).hint_text("start"));
+                ui.label("to");
+                ui.add(egui::TextEdit::singleline(&mut self.s.search_end).desired_width(80.0).hint_text("end"))
+                    .on_hover_text("28-bit hex addresses, e.g. 8000000 for attic RAM");
+            }
+            ui.label("Size:");
+            ui.selectable_value(&mut self.s.search_width, 1u8, "byte").on_hover_text("values 0-255: lives, energy, level, each score digit pair");
+            ui.selectable_value(&mut self.s.search_width, 2u8, "word").on_hover_text("values 0-65535 stored low byte first: timers, positions, some scores");
+            if started {
+                ui.label(RichText::new("(the range and size apply to the next new search)").weak().small());
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Value:");
+            let r = ui.add(egui::TextEdit::singleline(&mut self.s.search_value).desired_width(80.0).hint_text("e.g. 3 or $12"));
+            let value = mega65::parse_num(&self.s.search_value).ok();
+            let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if !started {
+                if ui.add_enabled(en && value.is_some(), egui::Button::new("Search for value")).clicked() || (enter && value.is_some() && en) {
+                    self.search_step(Filter::Equal(value.unwrap_or(0)), true);
+                }
+                if ui.add_enabled(en, egui::Button::new("Start with unknown value"))
+                    .on_hover_text("keep every address; narrow down with changed / increased / decreased as you play")
+                    .clicked()
+                {
+                    self.search_step(Filter::Any, true);
+                }
+            } else {
+                if ui.add_enabled(en && value.is_some(), egui::Button::new("= value")).clicked() || (enter && value.is_some() && en) {
+                    self.search_step(Filter::Equal(value.unwrap_or(0)), false);
+                }
+                if ui.add_enabled(en && value.is_some(), egui::Button::new("≠ value")).clicked() {
+                    self.search_step(Filter::NotEqual(value.unwrap_or(0)), false);
+                }
+                ui.separator();
+                if ui.add_enabled(en, egui::Button::new("Increased")).clicked() {
+                    self.search_step(Filter::Increased, false);
+                }
+                if ui.add_enabled(en, egui::Button::new("Decreased")).clicked() {
+                    self.search_step(Filter::Decreased, false);
+                }
+                if ui.add_enabled(en, egui::Button::new("Changed")).clicked() {
+                    self.search_step(Filter::Changed, false);
+                }
+                if ui.add_enabled(en, egui::Button::new("Unchanged")).clicked() {
+                    self.search_step(Filter::Unchanged, false);
+                }
+                if ui.add_enabled(en && value.is_some(), egui::Button::new("Up by value")).on_hover_text("increased by exactly the value").clicked() {
+                    self.search_step(Filter::IncreasedBy(value.unwrap_or(0)), false);
+                }
+                if ui.add_enabled(en && value.is_some(), egui::Button::new("Down by value")).clicked() {
+                    self.search_step(Filter::DecreasedBy(value.unwrap_or(0)), false);
+                }
+                ui.separator();
+                if ui.add_enabled(self.progress.is_none(), egui::Button::new("Start over")).clicked() {
+                    self.backend.send(Cmd::SearchReset);
+                }
+            }
+            if let Some((d, t)) = self.progress {
+                ui.add(egui::ProgressBar::new(d as f32 / t.max(1) as f32).desired_width(120.0).show_percentage());
+            }
+        });
+        if !started {
+            ui.label(
+                RichText::new(
+                    "Find where a game keeps a number: type the value you can see on screen (lives, energy, level) and search for it, or start with an unknown value. \
+                     Then play until it changes and press Increased / Decreased / Changed / Unchanged (or type the new value and press = value) until only a few addresses are left. \
+                     The CPU keeps running and nothing is written. Tip: scores are often stored as BCD, so a score of 1250 is the bytes $12 and $50.",
+                )
+                .weak()
+                .small(),
+            );
+            return;
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new(format!("{} address{} match", self.search.count, if self.search.count == 1 { "" } else { "es" })).strong());
+            ui.label(RichText::new(self.search.history.join("  ›  ")).weak().small());
+        });
+        if self.search.count == 0 {
+            ui.label(RichText::new("Nothing left. Press Start over; the value may be stored differently (word instead of byte, BCD, or in another memory range).").weak());
+            return;
+        }
+        let shown = self.search.hits.len();
+        if shown < self.search.count {
+            ui.label(RichText::new(format!("showing the first {shown}; keep filtering to narrow the list")).weak().small());
+        }
+        let width = self.search.width;
+        let mut add: Vec<u32> = Vec::new();
+        let mut peek: Option<u32> = None;
+        if self.search.count <= 16 {
+            if ui.small_button("Watch all").clicked() {
+                add.extend(self.search.hits.iter().map(|h| h.addr));
+            }
+        }
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            egui::Grid::new("searchgrid").striped(true).spacing([14.0, 2.0]).show(ui, |ui| {
+                for h in ["address", "value", "hex", "before", "", ""] {
+                    ui.label(RichText::new(h).weak());
+                }
+                ui.end_row();
+                for h in &self.search.hits {
+                    let a = h.addr;
+                    let lab = if a < 0x10000 { format!("${a:04X}") } else { format!("${a:07X}") };
+                    ui.label(RichText::new(lab).monospace());
+                    ui.label(RichText::new(format!("{}", h.value)).monospace().strong());
+                    ui.label(RichText::new(if width == 2 { format!("${:04X}", h.value) } else { format!("${:02X}", h.value) }).monospace());
+                    ui.label(RichText::new(if h.prev == h.value { "-".to_string() } else { format!("{}", h.prev) }).monospace().weak());
+                    if ui.small_button("→ Watch").on_hover_text("add to the Watches tab, where the value can be edited").clicked() {
+                        add.push(a);
+                    }
+                    if ui.small_button("Memory").on_hover_text("show in the Memory tab").clicked() {
+                        peek = Some(a);
+                    }
+                    ui.end_row();
+                }
+            });
+        });
+        if !add.is_empty() {
+            for a in add {
+                if self.s.watches.iter().any(|w| self.symbols.resolve(&w.expr).ok() == Some(a) && w.width == width) {
+                    continue;
+                }
+                let expr = if a < 0x10000 { format!("{a:04X}") } else { format!("{a:07X}") };
+                self.s.watches.push(WatchDef { expr: expr.clone(), name: format!("found {expr}"), width });
+            }
+            self.send_watches();
+            self.s.tab = Tab::Watches;
+        }
+        if let Some(a) = peek {
+            self.s.mem_addr[0] = format!("{:X}", a & !0xf);
+            self.s.tab = Tab::Memory;
+            self.send_views();
+        }
+    }
+
     fn dma_tab(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label("DMA list at:");
@@ -1286,6 +1495,7 @@ impl eframe::App for StudioApp {
                 ui.selectable_value(&mut self.s.tab, Tab::Screen, "Screen");
                 ui.selectable_value(&mut self.s.tab, Tab::Profiler, if self.prof_on { "Profiler ●" } else { "Profiler" });
                 ui.selectable_value(&mut self.s.tab, Tab::Watches, if self.s.watches.is_empty() { "Watches".to_string() } else { format!("Watches ({})", self.s.watches.len()) });
+                ui.selectable_value(&mut self.s.tab, Tab::Search, if self.search.started { format!("Search ({})", self.search.count) } else { "Search".to_string() });
                 ui.selectable_value(&mut self.s.tab, Tab::Dma, "DMA");
                 ui.selectable_value(&mut self.s.tab, Tab::Basic, "BASIC");
                 ui.selectable_value(&mut self.s.tab, Tab::Console, "Console / Log");
@@ -1297,6 +1507,7 @@ impl eframe::App for StudioApp {
                 Tab::Screen => self.screen_tab(ui),
                 Tab::Profiler => self.profiler_tab(ui),
                 Tab::Watches => self.watches_tab(ui),
+                Tab::Search => self.search_tab(ui),
                 Tab::Dma => self.dma_tab(ui),
                 Tab::Basic => self.basic_tab(ui),
                 Tab::Console => self.console_tab(ui),

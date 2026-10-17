@@ -60,6 +60,11 @@ pub enum Cmd {
     Watches(Vec<(u32, u8)>),
     /// Tokenize BASIC source and put it on the MEGA65 (see `mega65::basic`).
     SendBasic { source: String, opts: mega65::basic::Options, send: mega65::basic::SendOptions },
+    /// One memory-search step (see `mega65::memsearch`). `start` begins a new
+    /// search over these (start, len) regions with this width; otherwise the
+    /// filter refines the current one.
+    SearchStep { filter: mega65::memsearch::Filter, start: Option<(Vec<(u32, usize)>, u8)> },
+    SearchReset,
     Shutdown,
 }
 
@@ -89,7 +94,13 @@ pub enum Event {
     BasicProgress(&'static str, usize, usize),
     /// Send BASIC finished (or failed, with the reason).
     BasicDone(Result<mega65::basic::SendReport, String>),
+    /// Memory search state after a step: how many addresses match, the first
+    /// `hits.len()` of them, the width, and the step history.
+    Search { count: usize, hits: Vec<mega65::memsearch::Hit>, width: u8, history: Vec<String> },
 }
+
+/// Hits sent to the UI per search step; the count is always exact.
+const SEARCH_HITS_SHOWN: usize = 1000;
 
 pub struct Backend {
     pub tx: Sender<Cmd>,
@@ -142,6 +153,7 @@ struct Worker {
     prof_total: u32,
     symbols: std::sync::Arc<mega65::symbols::SymbolTable>,
     watches: Vec<(u32, u8)>,
+    search: Option<mega65::memsearch::Search>,
 }
 
 impl Worker {
@@ -166,6 +178,7 @@ impl Worker {
             prof_total: 0,
             symbols: Default::default(),
             watches: Vec::new(),
+            search: None,
         }
     }
 
@@ -436,6 +449,41 @@ impl Worker {
                 self.prof_hist.clear();
                 self.prof_total = 0;
             }
+            Cmd::SearchStep { filter, start } => {
+                if let Some((regions, width)) = start {
+                    self.search = Some(mega65::memsearch::Search::new(regions, width));
+                }
+                let Some(mut search) = self.search.take() else {
+                    return Err(mega65::Error::Other("no search in progress: start one first".into()));
+                };
+                // The profiler would fight the search for the link; pause it.
+                let was = self.prof_on;
+                self.prof_on = false;
+                let tx = self.tx.clone();
+                let ctx = self.ctx.clone();
+                let r = match self.mach() {
+                    Ok(m) => search.step(&mut m.mon, filter, &mut |d, t| {
+                        let _ = tx.send(Event::Progress(Some((d, t))));
+                        ctx.request_repaint();
+                    }),
+                    Err(e) => Err(e),
+                };
+                self.emit(Event::Progress(None));
+                self.prof_on = was;
+                let count = r?;
+                self.log(format!("search: {}", search.history.last().cloned().unwrap_or_default()));
+                self.emit(Event::Search {
+                    count,
+                    hits: search.hits().iter().take(SEARCH_HITS_SHOWN).copied().collect(),
+                    width: search.width,
+                    history: search.history.clone(),
+                });
+                self.search = Some(search);
+            }
+            Cmd::SearchReset => {
+                self.search = None;
+                self.emit(Event::Search { count: 0, hits: Vec::new(), width: 1, history: Vec::new() });
+            }
             Cmd::SetLive { enabled, interval, screen } => {
                 self.live = enabled;
                 self.interval = interval;
@@ -638,7 +686,9 @@ impl Worker {
 /// Read a PNG file as packed 8-bit RGB.
 fn decode_png_rgb(path: &std::path::Path) -> mega65::Result<(usize, usize, Vec<u8>)> {
     let other = |e: png::DecodingError| mega65::Error::Other(format!("{}: {e}", path.display()));
-    let decoder = png::Decoder::new(std::fs::File::open(path)?);
+    let mut decoder = png::Decoder::new(std::fs::File::open(path)?);
+    // Xemu writes palette PNGs for some screens; expand them to 8-bit RGB(A).
+    decoder.set_transformations(png::Transformations::normalize_to_color8());
     let mut reader = decoder.read_info().map_err(other)?;
     let mut buf = vec![0; reader.output_buffer_size()];
     let info = reader.next_frame(&mut buf).map_err(other)?;

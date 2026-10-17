@@ -44,6 +44,12 @@ fn selftest(device: String) {
     b.send(Cmd::Profiler { enabled: true, frame_flag: Some(0x74ba), bucket: 16 });
     std::thread::sleep(Duration::from_millis(2500));
     b.send(Cmd::Profiler { enabled: false, frame_flag: None, bucket: 16 });
+    // Memory search: unknown start over the first 64 KB, then "changed" twice.
+    use mega65::memsearch::Filter;
+    b.send(Cmd::SearchStep { filter: Filter::Any, start: Some((vec![(0, 0x10000)], 1)) });
+    b.send(Cmd::SearchStep { filter: Filter::Changed, start: None });
+    b.send(Cmd::SearchStep { filter: Filter::Changed, start: None });
+    b.send(Cmd::SearchReset);
     b.send(Cmd::Disconnect);
     b.send(Cmd::SetLive { enabled: false, interval: Duration::from_millis(500), screen: false });
     let start = Instant::now();
@@ -62,6 +68,8 @@ fn selftest(device: String) {
                         println!("Disconnected");
                         done = true;
                     }
+                    Event::Search { count, hits, history, .. } => println!("Search: {count} hits, first {:?}, last step {:?}", hits.first(), history.last()),
+                    Event::Progress(_) => {}
                     other => println!("{other:?}"),
                 }
             }

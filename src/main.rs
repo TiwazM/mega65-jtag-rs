@@ -198,6 +198,26 @@ enum Cmd {
         #[arg(long, default_value_t = 4)]
         passes: usize,
     },
+    /// Action Replay-style memory search: find a game variable by its value,
+    /// then narrow the list as it changes. Interactive: each line is a filter
+    /// (`5` or `=5` equal, `!=5`, `?` unknown, `+` increased, `-` decreased,
+    /// `+3` up by 3, `=` unchanged, `!` changed), `list`, `reset`, `quit`.
+    /// The CPU is never stopped and nothing is written.
+    Search {
+        /// Filters to apply before the prompt (e.g. `? + -`, with --frames between them on Xemu).
+        steps: Vec<String>,
+        /// Range to search (28-bit addresses; chip RAM, attic RAM at 8000000, colour RAM at FF80000).
+        #[arg(long, default_value = "0")]
+        start: String,
+        #[arg(long, default_value = "10000")]
+        end: String,
+        /// Compare 16-bit little-endian words instead of bytes.
+        #[arg(long)]
+        word: bool,
+        /// Xemu (ai-agent build): run this many frames before each step given on the command line.
+        #[arg(long)]
+        frames: Option<u32>,
+    },
     /// Decode a DMAgic job list at an address (on the machine, or in --file).
     DmaList {
         addr: String,
@@ -810,6 +830,102 @@ fn run(cmd: Cmd, mut mach: Machine, syms: &mega65::symbols::SymbolTable) -> anyh
             }
             for c in found.iter().take(30) {
                 println!("{}", c.describe());
+            }
+        }
+        Cmd::Search { steps, start, end, word, frames } => {
+            let (s, e) = (hx(&start)?, hx(&end)?);
+            if e <= s {
+                bail!("end must be after start");
+            }
+            let mut search = mega65::memsearch::Search::new(vec![(s, (e - s) as usize)], if word { 2 } else { 1 });
+            fn print_hit(h: &mega65::memsearch::Hit, width: u8) {
+                if width == 2 {
+                    println!("  ${:07X}  {:5} (${:04X})   was {:5} (${:04X})", h.addr, h.value, h.value, h.prev, h.prev);
+                } else {
+                    println!("  ${:07X}  {:3} (${:02X})   was {:3} (${:02X})", h.addr, h.value, h.value, h.prev, h.prev);
+                }
+            }
+            // One line of input: a filter or a command. Returns false to quit.
+            let run_step = |mach: &mut Machine, search: &mut mega65::memsearch::Search, line: &str| -> anyhow::Result<bool> {
+                let line = line.trim();
+                let lower = line.to_ascii_lowercase();
+                match lower.as_str() {
+                    "" => return Ok(true),
+                    "q" | "quit" | "exit" => return Ok(false),
+                    "reset" | "new" => {
+                        search.reset();
+                        println!("search cleared; the next filter starts a new one");
+                        return Ok(true);
+                    }
+                    "history" | "h" => {
+                        for (i, s) in search.history.iter().enumerate() {
+                            println!("{:2}. {s}", i + 1);
+                        }
+                        return Ok(true);
+                    }
+                    l if l == "list" || l.starts_with("list ") => {
+                        let n: usize = l[4..].trim().parse().unwrap_or(40);
+                        for h in search.hits().iter().take(n) {
+                            print_hit(h, search.width);
+                        }
+                        if search.count() > n {
+                            println!("  ... {} more", search.count() - n);
+                        }
+                        return Ok(true);
+                    }
+                    _ => {}
+                }
+                let f = match mega65::memsearch::Filter::parse(line) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        println!("{e}  (try: 5, =5, !=5, ?, +, -, +3, -3, =, !, list, history, reset, quit)");
+                        return Ok(true);
+                    }
+                };
+                let term = std::io::stderr().is_terminal();
+                let n = search.step(&mut mach.mon, f, &mut |done, total| {
+                    if term && total > 0x2000 {
+                        eprint!("\r{:3}%  ", done * 100 / total.max(1));
+                    }
+                })?;
+                if term {
+                    eprint!("\r      \r");
+                }
+                println!("{}: {n} address{} match", f.describe(), if n == 1 { "" } else { "es" });
+                if n <= 20 {
+                    for h in search.hits() {
+                        print_hit(h, search.width);
+                    }
+                }
+                Ok(true)
+            };
+            for st in &steps {
+                if let Some(n) = frames {
+                    if search.started() {
+                        mach.mon.xemu_frames(n)?;
+                    }
+                }
+                if !run_step(&mut mach, &mut search, st)? {
+                    return Ok(());
+                }
+            }
+            let interactive = std::io::stdin().is_terminal();
+            if interactive {
+                println!(
+                    "searching ${s:07X}-${e:07X} as {}s. Type a value to start (or ? for unknown), then play and type +, -, =, ! to narrow; list, reset, quit.",
+                    if word { "word" } else { "byte" }
+                );
+            }
+            let stdin = std::io::stdin();
+            loop {
+                if interactive {
+                    print!("search> ");
+                    std::io::stdout().flush()?;
+                }
+                let mut line = String::new();
+                if stdin.read_line(&mut line)? == 0 || !run_step(&mut mach, &mut search, &line)? {
+                    break;
+                }
             }
         }
         Cmd::DmaList { addr, file: None, f018a, .. } => {
