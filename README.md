@@ -61,6 +61,16 @@ By default this uploads the `remotesd` helper from mega65-tools into C64 memory
 resident for faster repeat use). `--direct` instead drives the SD controller
 registers through the monitor: slow, but touches nothing in memory.
 
+`put` stores each file in one unbroken run of clusters when the card has one
+(the way mega65_ftp does) and otherwise falls back to a fragmented chain. Disk
+images (`.d81`, `.d64`, `.d71`, `.d65`) must be contiguous for the Hypervisor
+to mount them, so for those, or for any file with `--contiguous`, the upload
+fails instead. `--fragmented` restores the old first-free-cluster order. The
+clusters and directory slot are chosen before anything is written, so a failed
+upload leaves the card (including a file it would have replaced) unchanged.
+`clusters FILE` reports whether a file is contiguous. Library users pick the
+same policies with `Fat32::write_file_with` and `fat32::Allocation`.
+
 JTAG (`m65rs jtag ...`): `list`, `idcode`, `bitinfo FILE.bit`, and
 `bit FILE.bit [--desync]` to configure the FPGA from a bitstream. That is
 volatile: the cores in flash are never written, and the next power cycle brings

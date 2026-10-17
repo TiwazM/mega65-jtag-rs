@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::{bail, Context};
 use clap::{Args, Parser, Subcommand};
 
-use mega65::fat32::Fat32;
+use mega65::fat32::{Allocation, Fat32};
 use mega65::jtag::xilinx::{part_name, Bitstream};
 use mega65::jtag::Jtag;
 use mega65::machine::{Machine, Prg};
@@ -377,8 +377,19 @@ enum SdCmd {
     },
     /// Download a file.
     Get { remote: String, local: Option<String> },
-    /// Upload a file.
-    Put { local: String, remote: Option<String> },
+    /// Upload a file. It goes in one unbroken run of clusters when the card
+    /// has one; disk images (.d81 etc.) must, so they fail if it has none.
+    Put {
+        local: String,
+        remote: Option<String>,
+        /// Fail rather than store the file fragmented.
+        #[arg(long, conflicts_with = "fragmented")]
+        contiguous: bool,
+        /// Take free clusters in order from the next-free hint, as older
+        /// versions did, even for disk images.
+        #[arg(long)]
+        fragmented: bool,
+    },
     /// Delete a file or (recursively, with -r) a directory.
     Del {
         path: String,
@@ -1127,11 +1138,18 @@ fn sd_run<D: BlockDevice>(fs: &mut Fat32<D>, cmd: &SdCmd) -> anyhow::Result<()> 
             std::fs::write(&local, &data)?;
             println!("got {} bytes -> {local}", data.len());
         }
-        SdCmd::Put { local, remote } => {
+        SdCmd::Put { local, remote, contiguous, fragmented } => {
             let data = std::fs::read(local).with_context(|| local.clone())?;
             let remote = remote.clone().unwrap_or_else(|| std::path::Path::new(local).file_name().unwrap().to_string_lossy().into_owned());
-            fs.write_file(&remote, &data, progress_bar)?;
-            println!("put {} bytes -> {remote}", data.len());
+            let alloc = match (contiguous, fragmented) {
+                (true, _) => Allocation::Contiguous,
+                (_, true) => Allocation::Any,
+                _ => Allocation::for_name(&remote),
+            };
+            fs.write_file_with(&remote, &data, alloc, progress_bar)?;
+            let e = fs.lookup(&remote)?.context("file missing after upload")?;
+            let runs = cluster_runs(&fs.chain(e.cluster)?);
+            println!("put {} bytes -> {remote} ({})", data.len(), describe_runs(&runs));
         }
         SdCmd::Del { path, recursive } => fs.delete(path, *recursive)?,
         SdCmd::Mkdir { path } => fs.mkdir(path)?,
@@ -1156,9 +1174,30 @@ fn sd_run<D: BlockDevice>(fs: &mut Fat32<D>, cmd: &SdCmd) -> anyhow::Result<()> 
             let e = fs.lookup(path)?.context("root has no cluster chain")?;
             let chain = fs.chain(e.cluster)?;
             println!("{} clusters: {:?}", chain.len(), chain);
+            println!("{}", describe_runs(&cluster_runs(&chain)));
         }
     }
     Ok(())
+}
+
+/// Split a cluster chain into runs of consecutive clusters: (first, length).
+fn cluster_runs(chain: &[u32]) -> Vec<(u32, usize)> {
+    let mut runs: Vec<(u32, usize)> = Vec::new();
+    for &c in chain {
+        match runs.last_mut() {
+            Some((first, len)) if *first + *len as u32 == c => *len += 1,
+            _ => runs.push((c, 1)),
+        }
+    }
+    runs
+}
+
+fn describe_runs(runs: &[(u32, usize)]) -> String {
+    match runs {
+        [] => "no clusters".into(),
+        [(first, len)] => format!("contiguous: {len} clusters from {first}"),
+        _ => format!("fragmented into {} runs", runs.len()),
+    }
 }
 
 impl SdCmd {

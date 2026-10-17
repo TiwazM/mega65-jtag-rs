@@ -1,12 +1,52 @@
 //! Minimal FAT32 implementation on top of a [`SectorCache`], enough for the
 //! file operations mega65_ftp offers: list, get, put, delete, mkdir, rename.
 
+use std::collections::HashSet;
+
 use crate::sdcard::{BlockDevice, SectorCache, SECTOR};
 use crate::{Error, Result};
 
 const EOC: u32 = 0x0fff_fff8;
 const ATTR_DIR: u8 = 0x10;
 const ATTR_LFN: u8 = 0x0f;
+
+/// How [`Fat32::write_file_with`] picks the clusters of a new file.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Allocation {
+    /// One unbroken run of clusters if the card has one, otherwise free
+    /// clusters in order from the FSInfo next-free hint.
+    #[default]
+    PreferContiguous,
+    /// One unbroken run of clusters, or fail without touching the card. Disk
+    /// images (D81 etc.) need this: the Hypervisor mounts them by start sector.
+    Contiguous,
+    /// Free clusters in order from the next-free hint, even if a run exists
+    /// (how uploads worked before contiguous allocation was added).
+    Any,
+}
+
+impl Allocation {
+    /// The default for a file name: `Contiguous` for disk images, which the
+    /// MEGA65 cannot mount when fragmented, `PreferContiguous` for the rest.
+    pub fn for_name(name: &str) -> Self {
+        let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+        if matches!(ext.as_str(), "d81" | "d64" | "d71" | "d65") {
+            Allocation::Contiguous
+        } else {
+            Allocation::PreferContiguous
+        }
+    }
+}
+
+/// Where a new directory entry will go: its slots, and the cluster to add to
+/// the directory first if it has no room (with the directory's last cluster),
+/// and end-of-directory markers before the entry that must become "deleted"
+/// so directory readers still reach it.
+struct EntryPlan {
+    slots: Vec<(u32, usize)>,
+    grow: Option<(u32, u32)>,
+    unterminate: Vec<(u32, usize)>,
+}
 
 #[derive(Debug, Clone)]
 pub struct DirEntry {
@@ -43,6 +83,8 @@ pub struct Fat32<D: BlockDevice> {
     pub root_cluster: u32,
     pub fsinfo: u32,
     first_data: u32,
+    /// One past the last cluster that exists on the volume.
+    end_cluster: u32,
     pub cwd: String,
     pub cwd_cluster: u32,
     /// Clusters allocated minus freed since the last FSInfo update.
@@ -84,6 +126,16 @@ impl<D: BlockDevice> Fat32<D> {
         let root_cluster = u32at(&vbr, 0x2c);
         let fsinfo = u16at(&vbr, 0x30) as u32;
         let first_data = reserved + nfats * spf;
+        // The last FAT sector usually has entries past the end of the volume;
+        // they read as free, so never hand them out.
+        let total_sectors = match u16at(&vbr, 0x13) {
+            0 => u32at(&vbr, 0x20),
+            n => n as u32,
+        };
+        let mut end_cluster = spf * 128;
+        if spc > 0 && total_sectors > first_data {
+            end_cluster = end_cluster.min((total_sectors - first_data) / spc + 2);
+        }
         let mut fs = Self {
             cache,
             partitions,
@@ -94,6 +146,7 @@ impl<D: BlockDevice> Fat32<D> {
             root_cluster,
             fsinfo,
             first_data,
+            end_cluster,
             cwd: "/".into(),
             cwd_cluster: root_cluster,
             alloc_delta: 0,
@@ -160,19 +213,115 @@ impl<D: BlockDevice> Fat32<D> {
     }
 
     fn total_clusters(&self) -> u32 {
-        self.spf * 128
+        self.end_cluster
     }
 
-    fn find_free_cluster(&mut self, from: u32) -> Result<u32> {
-        let total = self.total_clusters();
-        let start = from.max(2).max(self.next_free_hint);
-        for c in (start..total).chain(2..start) {
-            if self.fat_entry(c)? == 0 {
-                self.next_free_hint = c;
-                return Ok(c);
+    /// FAT entry lookup for scans: keeps the current FAT sector in `last`.
+    fn fat_entry_scan(&mut self, last: &mut Option<(u32, Vec<u8>)>, cluster: u32) -> Result<u32> {
+        let s = self.part_start + self.reserved + cluster / 128;
+        if last.as_ref().map(|(ls, _)| *ls) != Some(s) {
+            *last = Some((s, self.cache.read(s)?));
+        }
+        let sec = &last.as_ref().unwrap().1;
+        Ok(u32at(sec, (cluster as usize * 4) & 511) & 0x0fff_ffff)
+    }
+
+    /// Free for this operation: unused in the FAT or in `reusable` (the chain
+    /// of a file about to be replaced), and not already promised (`taken`).
+    fn is_free(&mut self, last: &mut Option<(u32, Vec<u8>)>, c: u32, reusable: &HashSet<u32>, taken: &HashSet<u32>) -> Result<bool> {
+        if taken.contains(&c) {
+            return Ok(false);
+        }
+        if reusable.contains(&c) {
+            return Ok(true);
+        }
+        Ok(self.fat_entry_scan(last, c)? == 0)
+    }
+
+    /// Choose `n` clusters for a file. Reads the FAT but writes nothing, so a
+    /// failure here leaves the filesystem as it was.
+    fn plan_clusters(&mut self, n: u32, alloc: Allocation, reusable: &HashSet<u32>, taken: &HashSet<u32>) -> Result<Vec<u32>> {
+        match alloc {
+            Allocation::Any => self.plan_any(n, reusable, taken),
+            Allocation::Contiguous => self.plan_run(n, reusable, taken)?.map_err(|longest| {
+                Error::Other(format!("no run of {n} contiguous free clusters on the SD card (longest is {longest})"))
+            }),
+            Allocation::PreferContiguous => match self.plan_run(n, reusable, taken)? {
+                Ok(v) => Ok(v),
+                Err(_) => self.plan_any(n, reusable, taken),
+            },
+        }
+    }
+
+    fn hint(&self) -> u32 {
+        if (2..self.total_clusters()).contains(&self.next_free_hint) {
+            self.next_free_hint
+        } else {
+            2
+        }
+    }
+
+    /// The first `n` free clusters from the next-free hint, wrapping round.
+    fn plan_any(&mut self, n: u32, reusable: &HashSet<u32>, taken: &HashSet<u32>) -> Result<Vec<u32>> {
+        let (end, hint) = (self.total_clusters(), self.hint());
+        let mut last = None;
+        let mut out = Vec::with_capacity(n as usize);
+        for c in (hint..end).chain(2..hint) {
+            if self.is_free(&mut last, c, reusable, taken)? {
+                out.push(c);
+                if out.len() as u32 == n {
+                    return Ok(out);
+                }
             }
         }
-        Err(Error::Other("SD card is full".into()))
+        Err(Error::Other(format!("SD card is full: need {n} clusters, {} free", out.len())))
+    }
+
+    /// The first run of `n` free clusters, or the longest run seen if there is
+    /// none. Like mega65_ftp's find_contiguous_clusters, except that it starts
+    /// at the next-free hint (free space is usually there, and each FAT sector
+    /// costs a serial round trip) and then searches from cluster 2 up to the
+    /// hint, so a run straddling the hint is found too.
+    fn plan_run(&mut self, n: u32, reusable: &HashSet<u32>, taken: &HashSet<u32>) -> Result<std::result::Result<Vec<u32>, u32>> {
+        let (end, hint) = (self.total_clusters(), self.hint());
+        let mut last = None;
+        let mut longest = 0;
+        for (from, to) in [(hint, end), (2, hint.saturating_add(n - 1).min(end))] {
+            let (mut start, mut len) = (from, 0);
+            for c in from..to {
+                if self.is_free(&mut last, c, reusable, taken)? {
+                    if len == 0 {
+                        start = c;
+                    }
+                    len += 1;
+                    longest = longest.max(len);
+                    if len == n {
+                        return Ok(Ok((start..start + n).collect()));
+                    }
+                } else {
+                    len = 0;
+                }
+            }
+            if hint == 2 {
+                break;
+            }
+        }
+        Ok(Err(longest))
+    }
+
+    /// Link `clusters` into a chain ending in end-of-chain.
+    fn link_chain(&mut self, clusters: &[u32]) -> Result<()> {
+        for (i, &c) in clusters.iter().enumerate() {
+            let next = clusters.get(i + 1).copied().unwrap_or(0x0fff_ffff);
+            self.set_fat_entry(c, next)?;
+        }
+        // Move the hint on if we just used the cluster it pointed at.
+        let hint = self.hint();
+        if clusters.contains(&hint) {
+            let after = clusters.last().unwrap() + 1;
+            self.next_free_hint = if after < self.total_clusters() { after } else { 2 };
+        }
+        Ok(())
     }
 
     fn free_chain(&mut self, cluster: u32) -> Result<()> {
@@ -415,8 +564,21 @@ impl<D: BlockDevice> Fat32<D> {
         Ok(out)
     }
 
+    /// Write a file, replacing any existing one with the same name, with the
+    /// allocation [`Allocation::for_name`] picks for it.
+    pub fn write_file(&mut self, path: &str, data: &[u8], progress: impl FnMut(u64, u64)) -> Result<()> {
+        let alloc = Allocation::for_name(path);
+        self.write_file_with(path, data, alloc, progress)
+    }
+
     /// Write a file, replacing any existing one with the same name.
-    pub fn write_file(&mut self, path: &str, data: &[u8], mut progress: impl FnMut(u64, u64)) -> Result<()> {
+    ///
+    /// The clusters and the directory slot are chosen before anything is
+    /// written, so if there is no room (or no contiguous run, with
+    /// [`Allocation::Contiguous`]) the filesystem, including any file being
+    /// replaced, is left exactly as it was. Only a device error part-way
+    /// through can leave a partial write.
+    pub fn write_file_with(&mut self, path: &str, data: &[u8], alloc: Allocation, mut progress: impl FnMut(u64, u64)) -> Result<()> {
         let full = self.normalise(path);
         let (dir, name) = full.rsplit_once('/').unwrap();
         let dir = if dir.is_empty() { "/" } else { dir };
@@ -424,27 +586,36 @@ impl<D: BlockDevice> Fat32<D> {
             return Err(Error::Other("empty file name".into()));
         }
         let dir_cluster = self.dir_cluster(dir)?;
-        if let Some(old) = self.read_dir(dir_cluster)?.into_iter().find(|e| e.name.eq_ignore_ascii_case(name)) {
+        let mut entries = self.read_dir(dir_cluster)?;
+        let old = entries.iter().position(|e| e.name.eq_ignore_ascii_case(name)).map(|i| entries.remove(i));
+        // The old file's clusters and directory slots are free for the new one.
+        let mut reusable = HashSet::new();
+        let mut freed = HashSet::new();
+        if let Some(old) = &old {
             if old.is_dir() {
                 return Err(Error::Other(format!("{full}: is a directory")));
             }
-            self.remove_entry(&old)?;
+            if old.cluster >= 2 {
+                reusable.extend(self.chain(old.cluster)?);
+            }
+            freed.extend(self.entry_locs(old)?);
         }
-        let nclusters = (data.len() as u32).div_ceil(self.spc * SECTOR as u32).max(1);
-        // Allocate the chain, preferring a contiguous run.
-        let mut clusters = Vec::with_capacity(nclusters as usize);
-        let mut c = self.next_free_hint;
-        while (clusters.len() as u32) < nclusters {
-            c = self.find_free_cluster(c)?;
-            clusters.push(c);
-            c += 1;
+        let bytes_per_cluster = self.spc as u64 * SECTOR as u64;
+        let nclusters = (data.len() as u64).div_ceil(bytes_per_cluster).max(1);
+        if nclusters >= self.total_clusters() as u64 {
+            return Err(Error::Other(format!("{full}: too big for the SD card")));
         }
-        for (i, &c) in clusters.iter().enumerate() {
-            let next = clusters.get(i + 1).copied().unwrap_or(0x0fff_ffff);
-            self.set_fat_entry(c, next)?;
+        let clusters = self.plan_clusters(nclusters as u32, alloc, &reusable, &HashSet::new())?;
+        let taken: HashSet<u32> = clusters.iter().copied().collect();
+        let (short, nlfn) = self.entry_names(name, &entries);
+        let plan = self.plan_entry(dir_cluster, nlfn + 1, &freed, &reusable, &taken)?;
+
+        // Everything is decided; only device errors can stop us from here on.
+        if let Some(old) = &old {
+            self.remove_entry(old)?;
         }
-        let entries = self.read_dir(dir_cluster)?;
-        self.create_entry(dir_cluster, &entries, name, 0x20, clusters[0], data.len() as u32)?;
+        self.link_chain(&clusters)?;
+        self.commit_entry(plan, &short, nlfn, name, 0x20, clusters[0], data.len() as u32)?;
         // Data.
         let mut off = 0usize;
         for &c in &clusters {
@@ -460,7 +631,12 @@ impl<D: BlockDevice> Fat32<D> {
             }
         }
         self.update_fsinfo()?;
-        self.cache.flush()
+        self.cache.flush()?;
+        // The FAT must now hold exactly the chain we planned.
+        if self.chain(clusters[0])? != clusters {
+            return Err(Error::Other(format!("{full}: FAT chain does not match what was written")));
+        }
+        Ok(())
     }
 
     pub fn delete(&mut self, path: &str, recursive: bool) -> Result<()> {
@@ -491,8 +667,11 @@ impl<D: BlockDevice> Fat32<D> {
         if entries.iter().any(|e| e.name.eq_ignore_ascii_case(name)) {
             return Err(Error::Other(format!("{full}: already exists")));
         }
-        let c = self.find_free_cluster(2)?;
-        self.set_fat_entry(c, 0x0fff_ffff)?;
+        let none = HashSet::new();
+        let c = self.plan_any(1, &none, &none)?[0];
+        let (short, nlfn) = self.entry_names(name, &entries);
+        let plan = self.plan_entry(parent, nlfn + 1, &HashSet::new(), &none, &HashSet::from([c]))?;
+        self.link_chain(&[c])?;
         let base = self.cluster_sector(c);
         let mut sec = vec![0u8; SECTOR];
         let (t, d) = now_fat();
@@ -515,7 +694,7 @@ impl<D: BlockDevice> Fat32<D> {
         for k in 1..self.spc {
             self.cache.write(base + k, &[0u8; SECTOR])?;
         }
-        self.create_entry(parent, &entries, name, ATTR_DIR, c, 0)?;
+        self.commit_entry(plan, &short, nlfn, name, ATTR_DIR, c, 0)?;
         self.update_fsinfo()?;
         self.cache.flush()
     }
@@ -530,15 +709,21 @@ impl<D: BlockDevice> Fat32<D> {
         if entries.iter().any(|x| x.name.eq_ignore_ascii_case(name)) {
             return Err(Error::Other(format!("{full}: already exists")));
         }
+        let others: Vec<DirEntry> = entries.into_iter().filter(|x| x.loc != e.loc).collect();
+        let (short, nlfn) = self.entry_names(name, &others);
+        let freed: HashSet<(u32, usize)> = self.entry_locs(&e)?.into_iter().collect();
+        let none = HashSet::new();
+        let plan = self.plan_entry(dir_cluster, nlfn + 1, &freed, &none, &none)?;
         self.wipe_entry(&e)?;
-        let entries = self.read_dir(dir_cluster)?;
-        self.create_entry(dir_cluster, &entries, name, e.attr, e.cluster, e.size)?;
+        self.commit_entry(plan, &short, nlfn, name, e.attr, e.cluster, e.size)?;
+        self.update_fsinfo()?;
         self.cache.flush()
     }
 
     // ---------------------------------------------------- entry plumbing
 
-    fn wipe_entry(&mut self, e: &DirEntry) -> Result<()> {
+    /// The directory slots an entry occupies: its LFN entries and the 8.3 entry.
+    fn entry_locs(&mut self, e: &DirEntry) -> Result<Vec<(u32, usize)>> {
         let mut locs = Vec::new();
         if let Some(start) = e.lfn_start {
             // Walk from the LFN start to the 8.3 entry.
@@ -557,7 +742,11 @@ impl<D: BlockDevice> Fat32<D> {
         } else {
             locs.push(e.loc);
         }
-        for (s, i) in locs {
+        Ok(locs)
+    }
+
+    fn wipe_entry(&mut self, e: &DirEntry) -> Result<()> {
+        for (s, i) in self.entry_locs(e)? {
             let mut sec = self.cache.read(s)?;
             sec[i * 32] = 0xe5;
             self.cache.write(s, &sec)?;
@@ -586,46 +775,76 @@ impl<D: BlockDevice> Fat32<D> {
         }
     }
 
-    /// Create a directory entry (with LFN entries if needed) in `dir_cluster`.
-    fn create_entry(&mut self, dir_cluster: u32, existing: &[DirEntry], name: &str, attr: u8, cluster: u32, size: u32) -> Result<()> {
+    /// The 8.3 name for `name` and how many LFN entries it needs.
+    fn entry_names(&self, name: &str, existing: &[DirEntry]) -> ([u8; 11], usize) {
         let (short, needs_lfn) = make_short_name(name, existing);
-        let nlfn = if needs_lfn { name.chars().count().div_ceil(13) } else { 0 };
-        let needed = nlfn + 1;
-        // Find `needed` free consecutive slots.
+        (short, if needs_lfn { name.chars().count().div_ceil(13) } else { 0 })
+    }
+
+    /// Find `needed` consecutive free slots in a directory, counting `freed`
+    /// slots (an entry about to be removed) as free. If there are none, plan
+    /// a new cluster for the directory. Writes nothing.
+    fn plan_entry(
+        &mut self,
+        dir_cluster: u32,
+        needed: usize,
+        freed: &HashSet<(u32, usize)>,
+        reusable: &HashSet<u32>,
+        taken: &HashSet<u32>,
+    ) -> Result<EntryPlan> {
         let mut slots: Vec<(u32, usize)> = Vec::new();
-        let mut chain = self.chain(dir_cluster)?;
-        'outer: loop {
-            for &c in &chain {
-                let base = self.cluster_sector(c);
-                for k in 0..self.spc {
-                    let s = base + k;
-                    let sec = self.cache.read(s)?;
-                    for i in 0..16 {
-                        let b = sec[i * 32];
-                        if b == 0 || b == 0xe5 {
-                            slots.push((s, i));
-                            if slots.len() == needed {
-                                break 'outer;
-                            }
-                        } else {
-                            slots.clear();
+        let mut zeros: Vec<(u32, usize)> = Vec::new();
+        let chain = self.chain(dir_cluster)?;
+        for &c in &chain {
+            let base = self.cluster_sector(c);
+            for k in 0..self.spc {
+                let s = base + k;
+                let sec = self.cache.read(s)?;
+                for i in 0..16 {
+                    let b = sec[i * 32];
+                    if b == 0 {
+                        zeros.push((s, i));
+                    }
+                    if b == 0 || b == 0xe5 || freed.contains(&(s, i)) {
+                        slots.push((s, i));
+                        if slots.len() == needed {
+                            zeros.retain(|z| !slots.contains(z));
+                            return Ok(EntryPlan { slots, grow: None, unterminate: zeros });
                         }
+                    } else {
+                        slots.clear();
                     }
                 }
             }
-            // Grow the directory by one cluster.
-            let last = *chain.last().unwrap();
-            let n = self.find_free_cluster(last)?;
-            self.set_fat_entry(n, 0x0fff_ffff)?;
-            self.set_fat_entry(last, n)?;
+        }
+        // Grow the directory by one cluster and put the whole entry in it.
+        if needed > 16 * self.spc as usize {
+            return Err(Error::Other("name too long for one directory cluster".into()));
+        }
+        let n = self.plan_any(1, reusable, taken)?[0];
+        let base = self.cluster_sector(n);
+        let slots = (0..needed).map(|i| (base + i as u32 / 16, i % 16)).collect();
+        Ok(EntryPlan { slots, grow: Some((*chain.last().unwrap(), n)), unterminate: zeros })
+    }
+
+    /// Write a directory entry (with LFN entries if needed) where `plan` says.
+    #[allow(clippy::too_many_arguments)]
+    fn commit_entry(&mut self, plan: EntryPlan, short: &[u8; 11], nlfn: usize, name: &str, attr: u8, cluster: u32, size: u32) -> Result<()> {
+        if let Some((last, n)) = plan.grow {
             let base = self.cluster_sector(n);
             for k in 0..self.spc {
                 self.cache.write(base + k, &[0u8; SECTOR])?;
             }
-            chain.push(n);
-            slots.clear();
+            self.set_fat_entry(n, 0x0fff_ffff)?;
+            self.set_fat_entry(last, n)?;
         }
-        let csum = lfn_checksum(&short);
+        for (s, i) in plan.unterminate {
+            let mut sec = self.cache.read(s)?;
+            sec[i * 32] = 0xe5;
+            self.cache.write(s, &sec)?;
+        }
+        let slots = plan.slots;
+        let csum = lfn_checksum(short);
         let chars: Vec<u16> = name.encode_utf16().collect();
         for (n, slot) in slots.iter().take(nlfn).enumerate() {
             let seq = nlfn - n;
@@ -650,7 +869,7 @@ impl<D: BlockDevice> Fat32<D> {
         }
         let (t, d) = now_fat();
         let mut e = [0u8; 32];
-        e[..11].copy_from_slice(&short);
+        e[..11].copy_from_slice(short);
         e[11] = attr;
         e[0x0e..0x10].copy_from_slice(&t.to_le_bytes());
         e[0x10..0x12].copy_from_slice(&d.to_le_bytes());
@@ -753,4 +972,359 @@ fn make_short_name(name: &str, existing: &[DirEntry]) -> ([u8; 11], bool) {
         }
     }
     (out, true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    const SPC: u32 = 1;
+    const RESERVED: u32 = 32;
+    const SPF: u32 = 17;
+    /// Clusters 2..END exist; the FAT has room for 17 * 128 = 2176 entries.
+    const END: u32 = 2000;
+    const BPC: usize = SPC as usize * SECTOR;
+
+    /// A disk image in memory, shared so a test can reopen or snapshot it.
+    #[derive(Clone)]
+    struct MemDisk(Rc<RefCell<Vec<u8>>>);
+
+    impl BlockDevice for MemDisk {
+        fn read_sectors(&mut self, first: u32, count: usize) -> Result<Vec<u8>> {
+            let img = self.0.borrow();
+            let a = (first as usize * SECTOR).min(img.len());
+            let b = ((first as usize + count) * SECTOR).min(img.len());
+            let mut v = img[a..b].to_vec();
+            v.resize(count * SECTOR, 0);
+            Ok(v)
+        }
+        fn write_sector(&mut self, sector: u32, data: &[u8]) -> Result<()> {
+            let mut img = self.0.borrow_mut();
+            let a = sector as usize * SECTOR;
+            assert!(a + SECTOR <= img.len(), "write past the end of the image: sector {sector}");
+            img[a..a + SECTOR].copy_from_slice(data);
+            Ok(())
+        }
+        fn preferred_batch(&self) -> usize {
+            16
+        }
+    }
+
+    /// A blank FAT32 volume without an MBR: cluster 2 is the root directory.
+    fn blank() -> MemDisk {
+        let first_data = RESERVED + 2 * SPF;
+        let total = first_data + (END - 2) * SPC;
+        let mut img = vec![0u8; total as usize * SECTOR];
+        let v = &mut img[..SECTOR];
+        v[11..13].copy_from_slice(&512u16.to_le_bytes());
+        v[13] = SPC as u8;
+        v[14..16].copy_from_slice(&(RESERVED as u16).to_le_bytes());
+        v[16] = 2;
+        v[0x20..0x24].copy_from_slice(&total.to_le_bytes());
+        v[0x24..0x28].copy_from_slice(&SPF.to_le_bytes());
+        v[0x2c..0x30].copy_from_slice(&2u32.to_le_bytes());
+        v[0x30..0x32].copy_from_slice(&1u16.to_le_bytes());
+        v[0x52..0x5a].copy_from_slice(b"FAT32   ");
+        v[510] = 0x55;
+        v[511] = 0xaa;
+        let fsi = &mut img[SECTOR..2 * SECTOR];
+        fsi[0..4].copy_from_slice(&0x4161_5252u32.to_le_bytes());
+        fsi[0x1e4..0x1e8].copy_from_slice(&0x6141_7272u32.to_le_bytes());
+        fsi[0x1e8..0x1ec].copy_from_slice(&(END - 3).to_le_bytes());
+        fsi[0x1ec..0x1f0].copy_from_slice(&3u32.to_le_bytes());
+        for fat in [RESERVED, RESERVED + SPF] {
+            let o = fat as usize * SECTOR;
+            img[o..o + 4].copy_from_slice(&0x0fff_fff8u32.to_le_bytes());
+            img[o + 4..o + 8].copy_from_slice(&0x0fff_ffffu32.to_le_bytes());
+            img[o + 8..o + 12].copy_from_slice(&0x0fff_ffffu32.to_le_bytes());
+        }
+        MemDisk(Rc::new(RefCell::new(img)))
+    }
+
+    fn data(clusters: usize, seed: u8) -> Vec<u8> {
+        (0..clusters * BPC - 7).map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed)).collect()
+    }
+
+    fn put(fs: &mut Fat32<MemDisk>, name: &str, clusters: usize, alloc: Allocation) -> Result<Vec<u8>> {
+        let d = data(clusters, name.len() as u8);
+        fs.write_file_with(name, &d, alloc, |_, _| {})?;
+        Ok(d)
+    }
+
+    /// Check a file's chain ends in end-of-chain, has the right length, stays
+    /// on the volume, reads back, and that both FAT copies and the FSInfo free
+    /// count agree. Reopens the image so nothing comes from the cache.
+    fn verify(disk: &MemDisk, path: &str, want: &[u8]) -> Vec<u32> {
+        let mut fs = Fat32::open(disk.clone()).unwrap();
+        let e = fs.lookup(path).unwrap().expect("file exists");
+        assert_eq!(e.size as usize, want.len());
+        let chain = fs.chain(e.cluster).unwrap();
+        assert_eq!(chain.len(), want.len().div_ceil(BPC).max(1), "chain length of {path}");
+        assert!(fs.fat_entry(*chain.last().unwrap()).unwrap() >= EOC, "{path} chain must end in end-of-chain");
+        assert!(chain.iter().all(|&c| (2..END).contains(&c)), "{path} uses a cluster off the volume: {chain:?}");
+        let unique: HashSet<u32> = chain.iter().copied().collect();
+        assert_eq!(unique.len(), chain.len(), "{path} chain repeats a cluster");
+        assert_eq!(fs.read_file(path, |_, _| {}).unwrap(), want, "{path} contents");
+        let img = disk.0.borrow();
+        let fat = |n: u32| &img[(RESERVED + n * SPF) as usize * SECTOR..(RESERVED + (n + 1) * SPF) as usize * SECTOR];
+        assert!(fat(0) == fat(1), "FAT copies differ");
+        drop(img);
+        let (counted, _, _) = fs.df(false).unwrap();
+        let (scanned, _, _) = fs.df(true).unwrap();
+        assert_eq!(counted, scanned, "FSInfo free count");
+        chain
+    }
+
+    fn is_run(chain: &[u32]) -> bool {
+        chain.windows(2).all(|w| w[1] == w[0] + 1)
+    }
+
+    /// Mark the clusters `used` picks as allocated (one-cluster orphan chains),
+    /// which is all the allocator sees of other files.
+    fn occupy(disk: &MemDisk, used: impl Fn(u32) -> bool) -> Fat32<MemDisk> {
+        let mut fs = Fat32::open(disk.clone()).unwrap();
+        for c in (3..END).filter(|&c| used(c)) {
+            if fs.fat_entry(c).unwrap() == 0 {
+                fs.set_fat_entry(c, 0x0fff_ffff).unwrap();
+            }
+        }
+        fs.update_fsinfo().unwrap();
+        fs.cache.flush().unwrap();
+        fs
+    }
+
+    /// Free space in single-cluster holes at 4, 6, 8, ... from `from` on.
+    fn checkerboard(disk: &MemDisk, from: u32) -> Fat32<MemDisk> {
+        occupy(disk, |c| c < from || c % 2 == 1)
+    }
+
+    fn snapshot(disk: &MemDisk) -> Vec<u8> {
+        disk.0.borrow().clone()
+    }
+
+    #[test]
+    fn default_is_contiguous_when_a_run_exists() {
+        let disk = blank();
+        // Holes at 4, 6, ..., 400, then free space from 400 on.
+        let mut fs = occupy(&disk, |c| c < 400 && c % 2 == 1);
+        // Point the hint at the holes: the old allocator would weave through them.
+        let first_hole = 4;
+        fs.next_free_hint = first_hole;
+        let d = data(10, 1);
+        fs.write_file("/BIG.PRG", &d, |_, _| {}).unwrap();
+        fs.close().unwrap();
+        let chain = verify(&disk, "/BIG.PRG", &d);
+        assert!(is_run(&chain), "{chain:?}");
+        assert_eq!(chain[0], 400, "should skip the holes: {chain:?}");
+    }
+
+    #[test]
+    fn any_keeps_the_old_hint_order() {
+        let disk = blank();
+        let mut fs = occupy(&disk, |c| c < 400 && c % 2 == 1);
+        let first_hole = 4;
+        fs.next_free_hint = first_hole;
+        let d = put(&mut fs, "/BIG.PRG", 10, Allocation::Any).unwrap();
+        fs.close().unwrap();
+        let chain = verify(&disk, "/BIG.PRG", &d);
+        let holes: Vec<u32> = (0..10).map(|i| first_hole + 2 * i).collect();
+        assert_eq!(chain, holes);
+    }
+
+    /// The whole volume as a checkerboard, so no run of 2 exists.
+    fn full_checkerboard(disk: &MemDisk) -> Fat32<MemDisk> {
+        let mut fs = checkerboard(disk, 3);
+        let longest = fs.plan_run(2, &HashSet::new(), &HashSet::new()).unwrap();
+        assert_eq!(longest, Err(1), "test setup should leave no run of 2");
+        fs
+    }
+
+    #[test]
+    fn contiguous_fails_cleanly_on_fragmented_space() {
+        let disk = blank();
+        let mut fs = full_checkerboard(&disk);
+        let old = put(&mut fs, "/KEEP.TXT", 1, Allocation::Any).unwrap();
+        fs.close().unwrap();
+        let before = snapshot(&disk);
+        let mut fs = Fat32::open(disk.clone()).unwrap();
+        let err = put(&mut fs, "/NEW.PRG", 3, Allocation::Contiguous).unwrap_err();
+        assert!(err.to_string().contains("no run of 3 contiguous"), "{err}");
+        // Replacing an existing file must not lose it either.
+        assert!(put(&mut fs, "/KEEP.TXT", 3, Allocation::Contiguous).is_err());
+        fs.close().unwrap();
+        assert!(snapshot(&disk) == before, "a failed allocation changed the image");
+        verify(&disk, "/KEEP.TXT", &old);
+    }
+
+    #[test]
+    fn disk_images_default_to_contiguous() {
+        assert_eq!(Allocation::for_name("/GAMES/Elite.D81"), Allocation::Contiguous);
+        assert_eq!(Allocation::for_name("x.d64"), Allocation::Contiguous);
+        assert_eq!(Allocation::for_name("PROG.PRG"), Allocation::PreferContiguous);
+        assert_eq!(Allocation::for_name("README"), Allocation::PreferContiguous);
+        let disk = blank();
+        let mut fs = full_checkerboard(&disk);
+        fs.close().unwrap();
+        let before = snapshot(&disk);
+        let mut fs = Fat32::open(disk.clone()).unwrap();
+        assert!(fs.write_file("/DISK.D81", &data(4, 0), |_, _| {}).is_err());
+        fs.close().unwrap();
+        assert!(snapshot(&disk) == before);
+    }
+
+    #[test]
+    fn prefer_falls_back_to_a_fragmented_chain() {
+        let disk = blank();
+        let mut fs = full_checkerboard(&disk);
+        let d = put(&mut fs, "/NEW.PRG", 5, Allocation::PreferContiguous).unwrap();
+        fs.close().unwrap();
+        let chain = verify(&disk, "/NEW.PRG", &d);
+        assert!(!is_run(&chain));
+    }
+
+    #[test]
+    fn full_card_fails_cleanly_and_keeps_the_old_file() {
+        let disk = blank();
+        let mut fs = full_checkerboard(&disk);
+        let old = put(&mut fs, "/KEEP.TXT", 2, Allocation::Any).unwrap();
+        let free = fs.df(true).unwrap().0 as usize;
+        fs.close().unwrap();
+        let before = snapshot(&disk);
+        let mut fs = Fat32::open(disk.clone()).unwrap();
+        // The old file's 2 clusters count as free, but that is still too few.
+        let err = put(&mut fs, "/KEEP.TXT", free + 3, Allocation::Any).unwrap_err();
+        assert!(err.to_string().contains("full"), "{err}");
+        fs.close().unwrap();
+        assert!(snapshot(&disk) == before);
+        verify(&disk, "/KEEP.TXT", &old);
+    }
+
+    #[test]
+    fn replacing_a_file_can_reuse_its_own_run() {
+        let disk = blank();
+        let mut fs = Fat32::open(disk.clone()).unwrap();
+        put(&mut fs, "/IMG.D81", 30, Allocation::Contiguous).unwrap();
+        fs.close().unwrap();
+        let mut fs = full_checkerboard(&disk);
+        let d = data(30, 9);
+        fs.write_file("/IMG.D81", &d, |_, _| {}).unwrap();
+        fs.close().unwrap();
+        assert!(is_run(&verify(&disk, "/IMG.D81", &d)));
+    }
+
+    #[test]
+    fn finds_a_run_that_straddles_the_hint() {
+        let disk = blank();
+        let mut fs = Fat32::open(disk.clone()).unwrap();
+        put(&mut fs, "/A", 100, Allocation::Any).unwrap(); // 3..103
+        put(&mut fs, "/HOLE", 10, Allocation::Any).unwrap(); // 103..113
+        let rest = END as usize - 113;
+        put(&mut fs, "/B", rest, Allocation::Any).unwrap(); // up to the end
+        fs.delete("/HOLE", false).unwrap();
+        fs.next_free_hint = 108;
+        let d = put(&mut fs, "/RUN", 8, Allocation::Contiguous).unwrap();
+        fs.close().unwrap();
+        assert_eq!(verify(&disk, "/RUN", &d), (103..111).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn never_allocates_past_the_end_of_the_volume() {
+        let disk = blank();
+        let mut fs = Fat32::open(disk.clone()).unwrap();
+        fs.next_free_hint = END - 5;
+        let d = put(&mut fs, "/A", 10, Allocation::Contiguous).unwrap();
+        let e = put(&mut fs, "/B", 10, Allocation::Any).unwrap();
+        fs.close().unwrap();
+        assert_eq!(verify(&disk, "/A", &d), (3..13).collect::<Vec<_>>());
+        let b = verify(&disk, "/B", &e);
+        assert_eq!(&b[..5], &[END - 5, END - 4, END - 3, END - 2, END - 1]);
+    }
+
+    #[test]
+    fn directory_growth_does_not_collide_with_the_run() {
+        let disk = blank();
+        let mut fs = Fat32::open(disk.clone()).unwrap();
+        // 16 slots per cluster: fill the root so the next entry needs a new cluster.
+        for i in 0..16 {
+            put(&mut fs, &format!("/F{i}"), 1, Allocation::Any).unwrap();
+        }
+        let d = put(&mut fs, "/A long name.prg", 20, Allocation::Contiguous).unwrap();
+        fs.close().unwrap();
+        let chain = verify(&disk, "/A long name.prg", &d);
+        assert!(is_run(&chain));
+        let mut fs = Fat32::open(disk.clone()).unwrap();
+        let root = fs.chain(2).unwrap();
+        assert_eq!(root.len(), 2);
+        assert!(!chain.contains(&root[1]));
+        for i in 0..16 {
+            assert!(fs.lookup(&format!("/F{i}")).unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn no_room_for_the_directory_entry_leaves_the_image_unchanged() {
+        let disk = blank();
+        let mut fs = Fat32::open(disk.clone()).unwrap();
+        for i in 0..16 {
+            put(&mut fs, &format!("/F{i}"), 1, Allocation::Any).unwrap();
+        }
+        // Leave exactly enough clusters for the file but none for the directory.
+        let free = fs.df(true).unwrap().0 as usize;
+        put(&mut fs, "/F0", 1 + free - 10, Allocation::Any).unwrap();
+        fs.close().unwrap();
+        let before = snapshot(&disk);
+        let mut fs = Fat32::open(disk.clone()).unwrap();
+        assert_eq!(fs.df(false).unwrap().0, 10);
+        assert!(put(&mut fs, "/NEW", 10, Allocation::Contiguous).is_err());
+        assert!(put(&mut fs, "/NEW", 10, Allocation::Any).is_err());
+        fs.close().unwrap();
+        assert!(snapshot(&disk) == before);
+        // mkdir needs a cluster for itself and one for the root: give it one.
+        let mut fs = Fat32::open(disk.clone()).unwrap();
+        put(&mut fs, "/F0", 1 + free - 1, Allocation::Any).unwrap();
+        fs.close().unwrap();
+        let before = snapshot(&disk);
+        let mut fs = Fat32::open(disk.clone()).unwrap();
+        assert!(fs.mkdir("/NEWDIR").is_err());
+        fs.close().unwrap();
+        assert!(snapshot(&disk) == before);
+    }
+
+    #[test]
+    fn mkdir_rename_and_replace_still_work() {
+        let disk = blank();
+        let mut fs = Fat32::open(disk.clone()).unwrap();
+        fs.mkdir("/Sub dir").unwrap();
+        let d = put(&mut fs, "/Sub dir/Some File.txt", 3, Allocation::PreferContiguous).unwrap();
+        fs.rename("/Sub dir/Some File.txt", "/Sub dir/Renamed with a long name.txt").unwrap();
+        let d2 = put(&mut fs, "/Sub dir/Renamed with a long name.txt", 5, Allocation::PreferContiguous).unwrap();
+        fs.close().unwrap();
+        assert_ne!(d, d2);
+        verify(&disk, "/Sub dir/Renamed with a long name.txt", &d2);
+        let mut fs = Fat32::open(disk.clone()).unwrap();
+        assert!(fs.lookup("/Sub dir/Some File.txt").is_err());
+        assert_eq!(fs.list(Some("/Sub dir"), false).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn growing_a_directory_keeps_every_entry_visible() {
+        // Long names take 3 slots, so the root's 16 slots end in a free gap
+        // that the next entry does not fit in; that gap must not end the directory.
+        let disk = blank();
+        let mut fs = Fat32::open(disk.clone()).unwrap();
+        fs.mkdir("/Small files").unwrap();
+        for i in 0..40 {
+            put(&mut fs, &format!("/Small files/file number {i}.bin"), 1, Allocation::Any).unwrap();
+        }
+        for i in (0..40).step_by(3) {
+            fs.delete(&format!("/Small files/file number {i}.bin"), false).unwrap();
+        }
+        fs.close().unwrap();
+        let mut fs = Fat32::open(disk.clone()).unwrap();
+        assert_eq!(fs.list(Some("/Small files"), false).unwrap().len(), 40 - 14);
+        drop(fs);
+        verify(&disk, "/Small files/file number 38.bin", &data(1, "/Small files/file number 38.bin".len() as u8));
+    }
 }
