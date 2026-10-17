@@ -234,8 +234,83 @@ enum Cmd {
     Vf011 { d81: String },
     /// SD card file access.
     Sd(SdArgs),
+    /// BASIC source files: send a .bas/.txt file to the MEGA65 as a runnable
+    /// program, tokenize one to a PRG, or list a program.
+    #[command(subcommand)]
+    Basic(BasicCmd),
     /// JTAG: adapter and FPGA operations.
     Jtag(JtagArgs),
+}
+
+#[derive(Args)]
+struct BasicOpts {
+    /// Keep upper/lower case in strings, REM and DATA for the lower-case
+    /// character set (capitals become SHIFTed letters).
+    #[arg(long)]
+    mixed_case: bool,
+    /// Leave `PRINT #` / `INPUT #` / `?#` as BASIC itself would read them
+    /// (a syntax error) instead of making them PRINT#/INPUT#.
+    #[arg(long)]
+    no_fix_hash: bool,
+    /// First line number and step for sources without line numbers.
+    #[arg(long, default_value_t = 10)]
+    start: u16,
+    #[arg(long, default_value_t = 10)]
+    step: u16,
+}
+
+impl BasicOpts {
+    fn options(&self, c64: bool) -> mega65::basic::Options {
+        mega65::basic::Options {
+            case: if self.mixed_case { mega65::basic::CaseMode::Mixed } else { mega65::basic::CaseMode::Upper },
+            auto_start: self.start,
+            auto_step: self.step,
+            fix_hash: !self.no_fix_hash,
+            c64,
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum BasicCmd {
+    /// Tokenize a source file and put it in BASIC memory on the MEGA65, check
+    /// it by reading it back, and optionally save and RUN it. BASIC must be at
+    /// its READY prompt.
+    Send {
+        file: String,
+        #[command(flatten)]
+        opts: BasicOpts,
+        /// Type the lines in through the keyboard buffer so the MEGA65's own
+        /// tokenizer is used, then compare with the PC's (slow cross-check).
+        #[arg(long = "type")]
+        type_in: bool,
+        /// DSAVE the program on the MEGA65 under this name afterwards (never
+        /// replaces an existing file).
+        #[arg(long)]
+        save: Option<String>,
+        /// RUN it afterwards.
+        #[arg(short, long)]
+        run: bool,
+    },
+    /// Tokenize a source file into a PRG on the PC (no hardware needed).
+    Tokenize {
+        file: String,
+        /// Output PRG (default: the source name with .prg).
+        #[arg(short, long)]
+        output: Option<String>,
+        /// C64 BASIC V2 at $0801 instead of BASIC 65 at $2001.
+        #[arg(long)]
+        c64: bool,
+        #[command(flatten)]
+        opts: BasicOpts,
+    },
+    /// List a PRG file, or the program in the MEGA65's memory when no file is given.
+    List {
+        file: Option<String>,
+        /// Show strings for the lower-case character set.
+        #[arg(long)]
+        mixed_case: bool,
+    },
 }
 
 #[derive(Args)]
@@ -321,6 +396,15 @@ enum JtagCmd {
     },
 }
 
+fn list_basic(mem: &[u8], start: u16, mixed: bool) -> anyhow::Result<()> {
+    let kw = mega65::basic::Keywords::basic65();
+    let case = if mixed { mega65::basic::CaseMode::Mixed } else { mega65::basic::CaseMode::Upper };
+    for (n, t) in mega65::basic::parse_memory(mem, start).map_err(anyhow::Error::msg)? {
+        println!("{n} {}", mega65::basic::detokenize(&t, &kw, case));
+    }
+    Ok(())
+}
+
 fn connect(cli: &Cli) -> anyhow::Result<Monitor> {
     let dev = match &cli.device {
         Some(d) => d.clone(),
@@ -388,6 +472,30 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Sd(s) => sd_cmd(&cli, s),
+        Cmd::Basic(BasicCmd::Tokenize { file, output, c64, opts }) => {
+            let src = mega65::basic::decode_source(&std::fs::read(file).with_context(|| file.clone())?);
+            let kw = mega65::basic::Keywords::basic65();
+            let prog = match mega65::basic::tokenize(&src, &kw, &opts.options(*c64)) {
+                Ok(p) => p,
+                Err(errs) => {
+                    errs.iter().for_each(|e| eprintln!("{file}: {e}"));
+                    bail!("{} error(s)", errs.len());
+                }
+            };
+            prog.warnings.iter().for_each(|w| eprintln!("{file}: {w}"));
+            let out = output.clone().unwrap_or_else(|| std::path::Path::new(file).with_extension("prg").to_string_lossy().into_owned());
+            let start = if *c64 { 0x0801 } else { 0x2001 };
+            let prg = prog.prg(start);
+            std::fs::write(&out, &prg)?;
+            println!("{} lines, {} bytes -> {out}", prog.lines.len(), prg.len() - 2);
+            Ok(())
+        }
+        Cmd::Basic(BasicCmd::List { file: Some(f), mixed_case }) => {
+            let b = std::fs::read(f).with_context(|| f.clone())?;
+            anyhow::ensure!(b.len() >= 4, "{f} is too short for a PRG");
+            let start = u16::from_le_bytes([b[0], b[1]]);
+            list_basic(&b[2..], start, *mixed_case)
+        }
         _ => {
             let mon = connect(&cli)?;
             run(cli.cmd, Machine::new(mon), &syms)
@@ -710,7 +818,35 @@ fn run(cmd: Cmd, mut mach: Machine, syms: &mega65::symbols::SymbolTable) -> anyh
             println!("{} reads, {} writes", vf.reads, vf.writes);
             r?;
         }
-        Cmd::Ports | Cmd::Sd(_) | Cmd::Jtag(_) | Cmd::DisasmFile { .. } | Cmd::DmaList { file: Some(_), .. } => unreachable!(),
+        Cmd::Basic(BasicCmd::Send { file, opts, type_in, save, run }) => {
+            let src = mega65::basic::decode_source(&std::fs::read(&file).with_context(|| file.clone())?);
+            let send = mega65::basic::SendOptions {
+                method: if type_in { mega65::basic::Method::Type } else { mega65::basic::Method::Direct },
+                save_as: save,
+                run,
+            };
+            let mut last = "";
+            let r = mach.send_basic(&src, &opts.options(false), &send, &mut |p| {
+                if p.stage != last {
+                    eprintln!("{}...", p.stage);
+                    last = p.stage;
+                }
+            })?;
+            r.warnings.iter().for_each(|w| eprintln!("{file}: {w}"));
+            for (n, pc, m) in &r.differences {
+                eprintln!("line {n} differs:\n  PC:     {pc}\n  MEGA65: {m}");
+            }
+            println!("{}", r.summary());
+            if !r.verified {
+                bail!("the program on the MEGA65 is not what was sent");
+            }
+        }
+        Cmd::Basic(BasicCmd::List { file: None, mixed_case }) => {
+            let (s, e) = mach.basic_range()?;
+            let mem = mach.mon.read_memory(s as u32, (e.saturating_sub(s)).max(2) as usize)?;
+            list_basic(&mem, s, mixed_case)?;
+        }
+        Cmd::Ports | Cmd::Sd(_) | Cmd::Basic(_) | Cmd::Jtag(_) | Cmd::DisasmFile { .. } | Cmd::DmaList { file: Some(_), .. } => unreachable!(),
     }
     Ok(())
 }

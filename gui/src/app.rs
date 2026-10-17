@@ -38,6 +38,15 @@ struct Settings {
     dma_addr: String,
     watches: Vec<WatchDef>,
     save_pause: bool,
+    basic_path: String,
+    basic_mixed_case: bool,
+    basic_fix_hash: bool,
+    basic_type_in: bool,
+    basic_run: bool,
+    basic_save: bool,
+    basic_save_name: String,
+    basic_auto_start: u16,
+    basic_auto_step: u16,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -71,6 +80,15 @@ impl Default for Settings {
             dma_addr: String::new(),
             watches: Vec::new(),
             save_pause: true,
+            basic_path: String::new(),
+            basic_mixed_case: false,
+            basic_fix_hash: true,
+            basic_type_in: false,
+            basic_run: true,
+            basic_save: false,
+            basic_save_name: String::new(),
+            basic_auto_start: 10,
+            basic_auto_step: 10,
         }
     }
 }
@@ -83,6 +101,7 @@ enum Tab {
     Profiler,
     Watches,
     Dma,
+    Basic,
     Console,
 }
 
@@ -132,6 +151,22 @@ pub struct StudioApp {
     watch_vals: Vec<WatchState>,
     watch_new: (String, String, u8),
     watch_edit: Option<(usize, String)>,
+    basic: BasicState,
+}
+
+/// The BASIC tab: the loaded source, its tokenized preview and the last send.
+#[derive(Default)]
+struct BasicState {
+    source: String,
+    /// Tokenized with the built-in table, for the preview and Save PRG.
+    preview: Option<Result<mega65::basic::Program, Vec<mega65::basic::Diagnostic>>>,
+    listing: String,
+    load_error: Option<String>,
+    mtime: Option<std::time::SystemTime>,
+    checked: Option<std::time::Instant>,
+    progress: Option<(&'static str, usize, usize)>,
+    sending: bool,
+    result: Option<Result<mega65::basic::SendReport, String>>,
 }
 
 #[derive(Default, Clone)]
@@ -187,8 +222,12 @@ impl StudioApp {
             watch_vals: Vec::new(),
             watch_new: (String::new(), String::new(), 1),
             watch_edit: None,
+            basic: BasicState::default(),
         };
         app.watch_vals = vec![WatchState::default(); app.s.watches.len()];
+        if !app.s.basic_path.is_empty() {
+            app.basic_reload();
+        }
         if !app.s.symbols_path.is_empty() {
             app.load_symbols(std::path::PathBuf::from(app.s.symbols_path.clone()));
         }
@@ -315,6 +354,15 @@ impl StudioApp {
                             w.value = Some(v);
                         }
                     }
+                }
+                Event::BasicProgress(stage, done, total) => self.basic.progress = Some((stage, done, total)),
+                Event::BasicDone(r) => {
+                    self.basic.sending = false;
+                    self.basic.progress = None;
+                    if let Err(e) = &r {
+                        self.last_error = Some(e.lines().next().unwrap_or("").to_string());
+                    }
+                    self.basic.result = Some(r);
                 }
                 Event::FrameFlagCandidates(v) => {
                     self.push_log(format!("frame flag scan: {} candidates", v.len()));
@@ -958,6 +1006,206 @@ impl StudioApp {
         });
     }
 
+    fn basic_options(&self) -> mega65::basic::Options {
+        mega65::basic::Options {
+            case: if self.s.basic_mixed_case { mega65::basic::CaseMode::Mixed } else { mega65::basic::CaseMode::Upper },
+            auto_start: self.s.basic_auto_start,
+            auto_step: self.s.basic_auto_step.max(1),
+            fix_hash: self.s.basic_fix_hash,
+            c64: false,
+        }
+    }
+
+    /// Read the source file again and redo the preview.
+    fn basic_reload(&mut self) {
+        let path = PathBuf::from(&self.s.basic_path);
+        self.basic.mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        self.basic.checked = Some(std::time::Instant::now());
+        match std::fs::read(&path) {
+            Ok(b) => {
+                self.basic.source = mega65::basic::decode_source(&b);
+                self.basic.load_error = None;
+                if self.s.basic_save_name.is_empty() {
+                    if let Some(stem) = path.file_stem() {
+                        self.s.basic_save_name = stem.to_string_lossy().to_uppercase().chars().take(16).collect();
+                    }
+                }
+            }
+            Err(e) => {
+                self.basic.source.clear();
+                self.basic.load_error = Some(format!("{}: {e}", path.display()));
+            }
+        }
+        self.basic_recompute();
+    }
+
+    fn basic_recompute(&mut self) {
+        if self.basic.source.is_empty() {
+            self.basic.preview = None;
+            self.basic.listing.clear();
+            return;
+        }
+        let kw = mega65::basic::Keywords::basic65();
+        let opts = self.basic_options();
+        let r = mega65::basic::tokenize(&self.basic.source, &kw, &opts);
+        self.basic.listing = match &r {
+            Ok(p) => p.listing(&kw, opts.case),
+            Err(_) => String::new(),
+        };
+        self.basic.preview = Some(r);
+    }
+
+    fn basic_tab(&mut self, ui: &mut egui::Ui) {
+        // Pick up edits made in the PC editor.
+        if !self.s.basic_path.is_empty() && self.basic.checked.map(|t| t.elapsed() > Duration::from_secs(1)).unwrap_or(true) {
+            let m = std::fs::metadata(&self.s.basic_path).and_then(|m| m.modified()).ok();
+            if m != self.basic.mtime {
+                self.basic_reload();
+            }
+            self.basic.checked = Some(std::time::Instant::now());
+            ui.ctx().request_repaint_after(Duration::from_secs(1));
+        }
+        ui.label(RichText::new("Write BASIC on the PC as plain text (.bas or .txt), then send it to the MEGA65 as a tokenized program ready to RUN; no D81 or IMPORT needed. The MEGA65 must be at the READY prompt.").weak().small());
+        let mut changed = false;
+        ui.horizontal(|ui| {
+            ui.label("Source:");
+            let r = ui.add(egui::TextEdit::singleline(&mut self.s.basic_path).desired_width(360.0).hint_text("program.bas"));
+            if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                self.basic_reload();
+            }
+            if ui.button("Browse…").clicked() {
+                if let Some(p) = rfd::FileDialog::new().add_filter("BASIC source", &["bas", "BAS", "txt", "TXT", "b65", "lst"]).add_filter("All files", &["*"]).pick_file() {
+                    self.s.basic_path = p.display().to_string();
+                    self.s.basic_save_name.clear();
+                    self.basic_reload();
+                }
+            }
+            if ui.add_enabled(!self.s.basic_path.is_empty(), egui::Button::new("Reload")).clicked() {
+                self.basic_reload();
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            changed |= ui
+                .checkbox(&mut self.s.basic_fix_hash, "fix PRINT # / INPUT #")
+                .on_hover_text("BASIC reads PRINT #4 (with a space) or ?#4 as PRINT followed by #4, a ?SYNTAX ERROR. This sends them as PRINT#4, the way they work when retyped.")
+                .changed();
+            ui.separator();
+            ui.label("letters in strings:");
+            changed |= ui.radio_value(&mut self.s.basic_mixed_case, false, "capitals").on_hover_text("every letter as typed on the MEGA65 without SHIFT (shows as capitals in the normal character set)").changed();
+            changed |= ui.radio_value(&mut self.s.basic_mixed_case, true, "keep upper/lower case").on_hover_text("for the lower-case character set (PRINT CHR$(14)): lower case stays lower case, capitals become SHIFTed letters").changed();
+            if let Some(Ok(p)) = &self.basic.preview {
+                if p.auto_numbered || self.s.basic_auto_start != 10 || self.s.basic_auto_step != 10 {
+                    ui.separator();
+                    ui.label("no line numbers: number from");
+                    changed |= ui.add(egui::DragValue::new(&mut self.s.basic_auto_start).range(0..=63999)).changed();
+                    ui.label("step");
+                    changed |= ui.add(egui::DragValue::new(&mut self.s.basic_auto_step).range(1..=1000)).changed();
+                }
+            }
+        });
+        if changed {
+            self.basic_recompute();
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.label("method:");
+            ui.radio_value(&mut self.s.basic_type_in, false, "direct (fast)").on_hover_text("tokenize here and write the program straight into BASIC memory, then read it back to check every byte");
+            ui.radio_value(&mut self.s.basic_type_in, true, "type it in (slow check)").on_hover_text("type each line into the MEGA65's keyboard buffer so its own tokenizer is used, then compare with the PC's result line by line");
+            ui.separator();
+            ui.checkbox(&mut self.s.basic_run, "RUN afterwards");
+            ui.checkbox(&mut self.s.basic_save, "SAVE on the MEGA65 as").on_hover_text("DSAVE to the MEGA65's current drive before running; an existing file with this name is never replaced");
+            ui.add_enabled(self.s.basic_save, egui::TextEdit::singleline(&mut self.s.basic_save_name).desired_width(140.0).char_limit(16));
+        });
+        let ok = matches!(self.basic.preview, Some(Ok(_)));
+        ui.horizontal(|ui| {
+            let can = self.connected && !self.busy && ok && !self.basic.sending;
+            let send = ui.add_enabled(can, egui::Button::new(RichText::new("Send BASIC").strong()).min_size(egui::vec2(110.0, 26.0)));
+            if send.clicked() {
+                self.basic_reload();
+                if let Some(Ok(_)) = &self.basic.preview {
+                    self.basic.sending = true;
+                    self.basic.result = None;
+                    self.basic.progress = Some(("starting", 0, 1));
+                    self.backend.send(Cmd::SendBasic {
+                        source: self.basic.source.clone(),
+                        opts: self.basic_options(),
+                        send: mega65::basic::SendOptions {
+                            method: if self.s.basic_type_in { mega65::basic::Method::Type } else { mega65::basic::Method::Direct },
+                            save_as: if self.s.basic_save { Some(self.s.basic_save_name.clone()) } else { None },
+                            run: self.s.basic_run,
+                        },
+                    });
+                }
+            }
+            if !self.connected {
+                ui.label(RichText::new("connect to a MEGA65 or Xemu first").weak());
+            }
+            if ui.add_enabled(ok, egui::Button::new("Save PRG…")).on_hover_text("write the tokenized program as a PRG file on the PC").clicked() {
+                let stem = std::path::Path::new(&self.s.basic_path).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "program".into());
+                if let Some(path) = rfd::FileDialog::new().set_file_name(format!("{stem}.prg")).save_file() {
+                    if let Some(Ok(p)) = &self.basic.preview {
+                        match std::fs::write(&path, p.prg(0x2001)) {
+                            Ok(()) => self.push_log(format!("saved {} ({} lines)", path.display(), p.lines.len())),
+                            Err(e) => self.last_error = Some(e.to_string()),
+                        }
+                    }
+                }
+            }
+            if let Some((stage, done, total)) = self.basic.progress {
+                let f = if total > 0 { done as f32 / total as f32 } else { 0.0 };
+                ui.add(egui::ProgressBar::new(f).desired_width(200.0).text(if total > 1 { format!("{stage} {done}/{total}") } else { stage.to_string() }));
+            }
+        });
+        let red = Color32::from_rgb(230, 90, 90);
+        let amber = Color32::from_rgb(220, 170, 60);
+        let green = Color32::from_rgb(90, 190, 90);
+        if let Some(e) = &self.basic.load_error {
+            ui.label(RichText::new(e).color(red));
+        }
+        match &self.basic.result {
+            Some(Ok(r)) => {
+                let (txt, col) = if r.verified { (format!("Sent: {}", r.summary()), green) } else { (format!("Sent, but the MEGA65 stored something else: {}", r.summary()), red) };
+                ui.label(RichText::new(txt).color(col));
+                for (n, pc, m) in &r.differences {
+                    ui.label(RichText::new(format!("line {n}: PC {pc}  |  MEGA65 {m}")).monospace().color(red));
+                }
+            }
+            Some(Err(e)) => {
+                for l in e.lines() {
+                    ui.label(RichText::new(l).color(red));
+                }
+            }
+            None => {}
+        }
+        match &self.basic.preview {
+            Some(Err(errs)) => {
+                for e in errs.iter().take(50) {
+                    ui.label(RichText::new(e.to_string()).color(red));
+                }
+            }
+            Some(Ok(p)) => {
+                for w in p.warnings.iter().take(50) {
+                    ui.label(RichText::new(w.to_string()).color(amber).small());
+                }
+            }
+            None => {}
+        }
+        ui.separator();
+        let n = match &self.basic.preview {
+            Some(Ok(p)) => format!("{} lines, {} bytes", p.lines.len(), p.bytes(0x2001).len()),
+            _ => String::new(),
+        };
+        ui.columns(2, |cols| {
+            cols[0].label(RichText::new("Source").strong());
+            egui::ScrollArea::both().id_salt("basic_src").show(&mut cols[0], |ui| {
+                ui.label(RichText::new(&self.basic.source).monospace());
+            });
+            cols[1].label(RichText::new(format!("As the MEGA65 will LIST it   {n}")).strong());
+            egui::ScrollArea::both().id_salt("basic_list").show(&mut cols[1], |ui| {
+                ui.label(RichText::new(&self.basic.listing).monospace());
+            });
+        });
+    }
+
     fn console_tab(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label(RichText::new("monitor>").monospace());
@@ -992,6 +1240,12 @@ impl eframe::App for StudioApp {
         // Dropped files load as PRGs.
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
         if let Some(p) = dropped.into_iter().next() {
+            if is_basic_source(&p) {
+                self.s.basic_path = p.display().to_string();
+                self.basic_reload();
+                self.s.tab = Tab::Basic;
+                return;
+            }
             self.s.prg_path = p.display().to_string();
             if self.connected {
                 self.backend.send(Cmd::LoadPrg { path: p, run: self.s.prg_run, binary: self.s.prg_binary, jump: None });
@@ -1018,6 +1272,7 @@ impl eframe::App for StudioApp {
                 ui.selectable_value(&mut self.s.tab, Tab::Profiler, if self.prof_on { "Profiler ●" } else { "Profiler" });
                 ui.selectable_value(&mut self.s.tab, Tab::Watches, if self.s.watches.is_empty() { "Watches".to_string() } else { format!("Watches ({})", self.s.watches.len()) });
                 ui.selectable_value(&mut self.s.tab, Tab::Dma, "DMA");
+                ui.selectable_value(&mut self.s.tab, Tab::Basic, "BASIC");
                 ui.selectable_value(&mut self.s.tab, Tab::Console, "Console / Log");
             });
             ui.separator();
@@ -1028,8 +1283,13 @@ impl eframe::App for StudioApp {
                 Tab::Profiler => self.profiler_tab(ui),
                 Tab::Watches => self.watches_tab(ui),
                 Tab::Dma => self.dma_tab(ui),
+                Tab::Basic => self.basic_tab(ui),
                 Tab::Console => self.console_tab(ui),
             }
         });
     }
+}
+
+fn is_basic_source(p: &std::path::Path) -> bool {
+    matches!(p.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(), Some("bas" | "txt" | "b65" | "lst"))
 }

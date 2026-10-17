@@ -374,9 +374,13 @@ impl Machine {
     /// Current BASIC program range (start, end) for the detected mode.
     pub fn basic_range(&mut self) -> Result<(u16, u16)> {
         self.detect_mode(Duration::from_secs(5))?;
-        let (startp, endp) = if self.mode == Mode::C65 { (0x2bu32, 0x82u32) } else { (0x2b, 0x2d) };
-        let s = self.mon.read_memory(startp, 2)?;
-        let e = self.mon.read_memory(endp, 2)?;
+        // BASIC 65 programs always start at $2001; $82 holds the end.
+        if self.mode == Mode::C65 {
+            let e = self.mon.read_memory(0x82, 2)?;
+            return Ok((0x2001, u16::from_le_bytes([e[0], e[1]])));
+        }
+        let s = self.mon.read_memory(0x2b, 2)?;
+        let e = self.mon.read_memory(0x2d, 2)?;
         Ok((u16::from_le_bytes([s[0], s[1]]), u16::from_le_bytes([e[0], e[1]])))
     }
 

@@ -7,6 +7,10 @@ fn main() -> eframe::Result {
     // `m65-studio --selftest DEVICE` drives the worker thread without a window
     // and prints every event; used to verify the backend against hardware/Xemu.
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(|a| a == "--selftest-basic").unwrap_or(false) {
+        selftest_basic(args.get(2).cloned().unwrap_or_default(), args.get(3).cloned().unwrap_or_default());
+        return Ok(());
+    }
     if args.get(1).map(|a| a == "--selftest").unwrap_or(false) {
         selftest(args.get(2).cloned().unwrap_or_default());
         return Ok(());
@@ -68,4 +72,36 @@ fn selftest(device: String) {
     if !done {
         println!("SELFTEST TIMED OUT");
     }
+}
+
+/// `m65-studio --selftest-basic DEVICE FILE`: send a BASIC source file through
+/// the worker exactly as the BASIC tab's Send button does (RUN afterwards).
+fn selftest_basic(device: String, file: String) {
+    use backend::{Backend, Cmd, Event};
+    use std::time::{Duration, Instant};
+    let b = Backend::start(egui::Context::default());
+    b.send(Cmd::SetLive { enabled: false, interval: Duration::from_millis(500), screen: false });
+    b.send(Cmd::Connect { device, baud: 2_000_000 });
+    let source = mega65::basic::decode_source(&std::fs::read(&file).expect("read source"));
+    let send = mega65::basic::SendOptions { run: true, ..Default::default() };
+    b.send(Cmd::SendBasic { source, opts: Default::default(), send });
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(60) {
+        match b.rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(Event::BasicDone(r)) => {
+                match r {
+                    Ok(rep) => println!("BASIC OK: {}", rep.summary()),
+                    Err(e) => println!("BASIC FAILED: {e}"),
+                }
+                return;
+            }
+            Ok(Event::BasicProgress(stage, d, t)) => println!("progress: {stage} {d}/{t}"),
+            Ok(Event::Error(e)) => println!("error: {e}"),
+            Ok(Event::Log(l)) => println!("log: {l}"),
+            Ok(_) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(_) => break,
+        }
+    }
+    println!("SELFTEST TIMED OUT");
 }

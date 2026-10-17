@@ -56,6 +56,8 @@ pub enum Cmd {
     DmaList { addr: u32 },
     /// Addresses (and widths in bytes, 1 or 2) to read on every poll.
     Watches(Vec<(u32, u8)>),
+    /// Tokenize BASIC source and put it on the MEGA65 (see `mega65::basic`).
+    SendBasic { source: String, opts: mega65::basic::Options, send: mega65::basic::SendOptions },
     Shutdown,
 }
 
@@ -81,6 +83,10 @@ pub enum Event {
     DmaList { addr: u32, text: String },
     /// Current watch values, in the order they were registered.
     Watches(Vec<u32>),
+    /// Send BASIC progress: stage, done, total.
+    BasicProgress(&'static str, usize, usize),
+    /// Send BASIC finished (or failed, with the reason).
+    BasicDone(Result<mega65::basic::SendReport, String>),
 }
 
 pub struct Backend {
@@ -402,6 +408,21 @@ impl Worker {
                 let bytes = self.mach()?.mon.read_memory(addr, 512)?;
                 let text = mega65::dma::decode(&bytes, true).describe(addr);
                 self.emit(Event::DmaList { addr, text });
+            }
+            Cmd::SendBasic { source, opts, send } => {
+                let tx = self.tx.clone();
+                let ctx = self.ctx.clone();
+                let m = self.mach()?;
+                let r = m.send_basic(&source, &opts, &send, &mut |p| {
+                    let _ = tx.send(Event::BasicProgress(p.stage, p.done, p.total));
+                    ctx.request_repaint();
+                });
+                match &r {
+                    Ok(rep) => self.log(format!("BASIC: {}", rep.summary())),
+                    Err(e) => self.log(format!("BASIC: {e}")),
+                }
+                self.emit(Event::BasicDone(r.map_err(|e| e.to_string())));
+                self.refresh_all()?;
             }
             Cmd::ProfilerReset => {
                 self.prof_hist.clear();

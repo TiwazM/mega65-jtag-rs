@@ -65,6 +65,64 @@ JTAG (`m65rs jtag ...`): `list`, `idcode`, `bitinfo FILE.bit`, and
 volatile: the cores in flash are never written, and the next power cycle brings
 the flashed core back. The bitstream's IDCODE is checked against the FPGA first.
 
+## Sending BASIC source
+
+Write a BASIC 65 program on the PC as plain text and get a runnable program on
+the MEGA65 in one step, without packing it into a D81 and `IMPORT`ing it:
+
+```
+m65rs basic send game.bas --run              # tokenize, write, verify, RUN
+m65rs basic send game.bas --save GAME --run  # also DSAVE "GAME" on the MEGA65
+m65rs basic send game.bas --type             # let the MEGA65 tokenize it (slow cross-check)
+m65rs basic tokenize game.bas -o game.prg    # PRG on the PC, no hardware
+m65rs basic list [game.prg]                  # list a PRG, or the program in memory
+```
+
+BASIC stores programs *tokenized*: each keyword becomes a one- or two-byte code
+(`PRINT` is `$99`, `DOPEN` is `$FE $0D`). `basic send` does that conversion on
+the PC with the keyword tables it reads out of the MEGA65's own ROM (a built-in
+copy of ROM 920413's tables is the fallback), writes the program to `$2001`,
+sets BASIC's end-of-program pointer, then reads the whole program back and
+checks every byte and every line link. The MEGA65 must be at `READY.`; a
+running program is refused. In C64 mode the program goes to `$0801` with C64
+BASIC V2 keywords.
+
+The tokenizer follows the ROM's own rules, which were checked by typing
+about 1,000 lines (every keyword, plus random keyword soup) into Xemu's ROM
+and comparing the stored bytes: longest keyword wins (`DOT` is not `DO T`),
+nothing is tokenized in strings, after `REM` or in `DATA`, `?` is `PRINT`,
+hex digits after `$` are left alone (`$D020`; so `A$FOR` is `A$F OR`), one space
+after the line number is dropped. `--type` repeats that check on your machine
+for your program: it types each line into the keyboard buffer (only when the
+buffer is empty, so nothing is dropped), lets the ROM tokenize it, and reports
+any line that differs from the PC's version.
+
+Source format:
+
+- line numbers as usual; a file with no line numbers at all is numbered 10, 20,
+  30... (`--start`, `--step`). Lines out of order are sorted, duplicates keep
+  the last, as typing them would;
+- keywords in any case. Letters in strings, `REM` and `DATA` become plain
+  letters (capitals on screen); `--mixed-case` keeps upper/lower case for the
+  lower-case character set instead (capitals become SHIFTed letters, as
+  `petcat` does);
+- control codes in braces as most PC tools write them: `{clr}`, `{home}`,
+  `{rvs on}`, `{red}`, `{3 down}`, `{f1}`, `{147}`, `{$93}`; `£ π ↑ ←` and the
+  box-drawing characters Studio's screen view shows are accepted as UTF-8;
+- CR, LF or CR LF line endings, UTF-8 or Windows-1252 text, tabs (become spaces).
+
+**`PRINT #4` and IMPORT.** BASIC 65 reads `PRINT #4` (with a space) and `?#4` as
+`PRINT` followed by `#4`, which stops with `?SYNTAX ERROR` when run; only
+`PRINT#4` is the print-to-file statement. `INPUT #4` is worse: it becomes a
+plain `INPUT` that waits for the keyboard instead of reading the file
+(`GET #4` happens to work). Checked on a real MEGA65 with ROM 920413. `IMPORT` tokenizes
+lines exactly as if typed, so a listing written with the space fails after
+`IMPORT` and works once the line is retyped without it. `basic send` turns
+`PRINT #`, `INPUT #` and `?#` into the real `PRINT#`/`INPUT#` tokens and lists
+each line it changed (`--no-fix-hash` keeps BASIC's reading). Another common
+IMPORT surprise: a SEQ file in ASCII lower case comes in as SHIFTed letters, so
+no keyword is recognised; `basic send` takes either case.
+
 ## GUI: MEGA65 Studio
 
 `cargo run --release -p m65-studio` opens a debugger-style window (egui, so it
@@ -82,12 +140,17 @@ builds the same on macOS, Windows and Linux):
   once per rendered frame, with a Find… button that locates such bytes), a
   watch list (named bytes/words that refresh on every poll, flash on change,
   show a changes-per-second figure and can be edited in place), a DMA list
-  decoder, and a console for raw monitor commands with the log. Addresses
+  decoder, a BASIC tab (pick or drop a `.bas`/`.txt` file, see the listing
+  as the MEGA65 will show it with any errors or fixes, then Send BASIC, with
+  optional RUN and DSAVE, a progress bar, and the read-back check; the file is
+  re-read when it changes on disk, so edit on the PC and press Send again; Save
+  PRG… writes the tokenized program locally), and a console for raw monitor commands with the log. Addresses
   typed anywhere may be symbol names, and disassembly shows labels.
 
 All hardware traffic runs on one worker thread, so the UI never blocks and
 panels can't interleave commands. Settings persist between runs.
-`m65-studio --selftest DEVICE` exercises that worker without a window.
+`m65-studio --selftest DEVICE` exercises that worker without a window, and
+`m65-studio --selftest-basic DEVICE FILE.bas` sends a BASIC file through it.
 
 ### macOS app bundle
 
@@ -120,6 +183,7 @@ let regs = m.mon.wait_for_break(None)?;
 ```
 
 Modules: `monitor` (protocol, memory, CPU control), `machine` (MEGA65 helpers),
+`basic` (BASIC 65 / V2 tokenizer, lister, `Machine::send_basic`),
 `screen` (capture/render), `sdcard` + `fat32` (SD access), `vf011`, `jtag`
 (`mpsse`, `xilinx`), `transport`.
 
