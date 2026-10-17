@@ -1,0 +1,159 @@
+From a3b82be333d56a96f1581debb330b78ba56f140a Mon Sep 17 00:00:00 2001
+From: Tiwaz <82827604+TiwazM@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 15:26:14 +0200
+Subject: [PATCH 3/3] MEGA65: uartmon: execute every queued command and answer
+ in the same update
+
+The monitor used to read one command per frame and send its answer on
+the following frame (40 ms per command at PAL), and bytes of a second
+command in the same buffer were dropped. Now every complete line in the
+receive buffer is executed in order, each with its own dot prompt, until
+a command delays its answer (trace, ~frames) or the output buffer is
+half full, and the answers are sent immediately. Twenty queued commands
+take 6 ms instead of 800 ms.
+
+~shot now answers at once ("SHOT QUEUED"); the PNG exists once the next
+~frames has answered, since that frame has then been closed.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ targets/mega65/uart_monitor.c | 83 ++++++++++++++++++-----------------
+ 1 file changed, 43 insertions(+), 40 deletions(-)
+
+diff --git a/targets/mega65/uart_monitor.c b/targets/mega65/uart_monitor.c
+index 2e61f0e0..790391da 100644
+--- a/targets/mega65/uart_monitor.c
++++ b/targets/mega65/uart_monitor.c
+@@ -61,7 +61,7 @@ void (*m65mon_callback)(void) = NULL;
+ int breakpoint_pc = -1;
+ int watchpoint_addr = -1;
+ int watchpoint_val = -1;
+-// --- AI-agent proof of concept additions (see AI-POC.md) ---
++// --- Monitor extensions for automated testing / AI agents (~frames, ~joy, ~shot, ~sleepless, ~mem) ---
+ int   umon_frames_left = 0;			// >0: run this many frames, then pause and answer
+ Uint8 umon_joy_mask[2] = { 0xFF, 0xFF };	// active-low joystick override masks for port 1 and 2
+ static int   umon_shot_pending = 0;
+@@ -430,7 +430,7 @@ static void execute_command ( char *cmd )
+ 					strcpy(umon_shot_path, cmd);
+ 					umon_shot_pending = 1;
+ 					vic4_registered_screenshot_request = 1;
+-					umon_send_ok = 0;
++					umon_printf("SHOT QUEUED %s", cmd);
+ 				} else
+ 					umon_printf(UMON_SYNTAX_ERROR "path missing or too long");
+ 			} else if (!strncmp(cmd, "sleepless", 9)) {
+@@ -484,13 +484,11 @@ const char *uartmon_screenshot_path ( void )
+ }
+ 
+ // Called by vic4_close_frame_access() once a "~shot" request has been written to disk.
++// The client learns that the file is complete because its following "~frames N" answers
++// only after that frame closed; nothing is sent from here (the client may be between commands).
+ void uartmon_screenshot_done ( const char *fullpath )
+ {
+-	if (!umon_shot_pending)
+-		return;
+ 	umon_shot_pending = 0;
+-	umon_printf("SHOT %s", fullpath);
+-	uartmon_finish_command();
+ }
+ 
+ // Called by the main loop at the end of every frame.
+@@ -624,8 +622,6 @@ void uartmon_finish_command ( void )
+ 	umon_write_buffer[umon_write_size++] = '.';	// add the 'dot prompt'! (m65dbg seems to check LF + dot for end of the answer)
+ 	umon_write_buffer[umon_write_size++] = '\r';	// I can't seem to see the dot over tcp unless I add a CRLF...
+ 	umon_write_buffer[umon_write_size++] = '\n';
+-	umon_read_pos = 0;
+-	umon_echo = 1;
+ }
+ 
+ 
+@@ -695,7 +691,7 @@ void uartmon_update ( void )
+ 				FATAL("FATAL: negative umon_write_size!");
+ 			if (!umon_write_size)
+ 				break;
+-			ret = xemusock_send(sock_client, umon_write_buffer + umon_write_pos, umon_write_size, &xerr);	// AI-POC: keep going while the socket takes it
++			ret = xemusock_send(sock_client, umon_write_buffer + umon_write_pos, umon_write_size, &xerr);	// keep going while the socket takes it
+ 		}
+ 		if (umon_write_size)
+ 			return;	// if we still have bytes to write, return and leave the work for the next update
+@@ -714,39 +710,46 @@ void uartmon_update ( void )
+ 		DEBUGPRINT("UARTMON: connection closed by peer while reading" NL);
+ 		return;
+ 	}
+-	if (ret > 0) {
+-		/* ECHO: provide echo for the client */
+-		if (umon_echo) {
+-			char*p = umon_read_buffer + umon_read_pos;
+-			int n = ret;
+-			while (n--)
+-				if (*p != 13 && *p != 10) {
+-					umon_write_buffer[umon_write_size++] = *(p++);
+-				} else {
+-					umon_echo = 0; // setting to zero avoids more input to echo, and also signs a complete command
+-					*p = 0; // terminate string in read buffer
+-					break;
+-				}
+-		}
+-		/* ECHO: end */
++	if (ret > 0)
+ 		umon_read_pos += ret;
+-		umon_read_buffer[umon_read_pos] = 0;
+-		//debug_buffer(umon_read_buffer);
+-		if (!umon_echo || sizeof(umon_read_buffer) - umon_read_pos - 1 == 0) {
+-			umon_read_buffer[sizeof(umon_read_buffer) - 1] = 0; // just in case of a "mega long command" with filled rx buffer ...
+-			umon_write_buffer[umon_write_size++] = '\r';
+-			umon_write_buffer[umon_write_size++] = '\n';
+-			umon_send_ok = 1;	// by default, command is finished after the execute_command()
+-			execute_command(umon_read_buffer);	// Execute our command!
+-			// command may delay (like with trace) the finish of the command with
+-			// setting umon_send_ok to zero. In this case, some need to call
+-			// uartmon_finish_command() some time otherwise the monitor connection
+-			// will just hang!
+-			if (umon_send_ok)
+-				uartmon_finish_command();
+-		}
++	umon_read_buffer[umon_read_pos] = 0;
++	// Execute every complete command line we have. A client may send several commands at once;
++	// they are answered in order, each with its own dot-prompt. Stop (and keep the rest for the
++	// next update) when a command delays its answer (trace, ~frames) or the output buffer is filling up.
++	while (umon_read_pos > 0) {
++		char *nl = umon_read_buffer;
++		while (*nl && *nl != 13 && *nl != 10)
++			nl++;
++		int consumed;
++		if (*nl) {
++			consumed = nl - umon_read_buffer + 1;
++			if (*nl == 13 && nl[1] == 10)
++				consumed++;	// CRLF counts as one terminator
++			*nl = 0;
++		} else if (umon_read_pos >= (int)sizeof(umon_read_buffer) - 1) {
++			consumed = umon_read_pos;	// "mega long command" with filled rx buffer: execute what we have
++		} else
++			break;				// incomplete line, wait for more
++		if (umon_write_size > UMON_WRITE_BUFFER_SIZE / 2)
++			break;				// let the answers drain first
++		if (umon_echo)
++			umon_printf("%s", umon_read_buffer);	// echo the command line, like a real terminal would
++		umon_write_buffer[umon_write_size++] = '\r';
++		umon_write_buffer[umon_write_size++] = '\n';
++		umon_send_ok = 1;	// by default, command is finished after the execute_command()
++		execute_command(umon_read_buffer);	// Execute our command!
++		memmove(umon_read_buffer, umon_read_buffer + consumed, umon_read_pos - consumed + 1);
++		umon_read_pos -= consumed;
++		// command may delay (like with trace) the finish of the command with
++		// setting umon_send_ok to zero. In this case, some need to call
++		// uartmon_finish_command() some time otherwise the monitor connection
++		// will just hang!
++		if (umon_send_ok)
++			uartmon_finish_command();
++		else
++			break;
+ 	}
+-	// AI-POC: push the answer out right away instead of waiting a whole frame for the next update
++	// Push the answers out right away instead of waiting a whole frame for the next update
+ 	while (umon_write_size && umon_send_ok) {
+ 		ret = xemusock_send(sock_client, umon_write_buffer + umon_write_pos, umon_write_size, &xerr);
+ 		if (ret <= 0)
+-- 
+2.47.0
+
