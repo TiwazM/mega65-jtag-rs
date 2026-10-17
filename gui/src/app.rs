@@ -178,8 +178,10 @@ struct SdState {
     entries: Vec<mega65::fat32::DirEntry>,
     /// (free clusters, total clusters, bytes per cluster) from the card.
     free: Option<(u64, u64, u64)>,
-    /// Disk images in the card's root and their first sectors, for naming mounts.
+    /// Disk images in the listed folder and their first sectors, for marking mounts.
     images: Vec<(String, u32)>,
+    /// The same for the root folder, for naming mounts in the Drives tab.
+    root_images: Vec<(String, u32)>,
     /// First sectors of the images on drives 8 and 9 when last listed.
     mounted: [u32; 2],
     /// An operation is running on the worker.
@@ -509,8 +511,9 @@ impl StudioApp {
                 }
                 Event::SdListing { path, entries, free, images, mounted } => {
                     if path.trim_matches('/').is_empty() {
-                        self.sd.images = images;
+                        self.sd.root_images = images.clone();
                     }
+                    self.sd.images = images;
                     self.sd.mounted = mounted;
                     self.s.sd_path = path.clone();
                     self.sd.listed = Some(path);
@@ -1718,7 +1721,7 @@ impl StudioApp {
     }
 
     fn sd_tab(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("Copy files between this computer and the SD card in the MEGA65. Uploads go into one unbroken run of clusters when the card has room, which disk images need before the MEGA65 can mount them. A disk image (.d81, .d64, .d71, .d65) in the root folder can be put on drive 8 with Mount on MEGA65: Studio brings the MEGA65 to the BASIC 65 prompt (stopping the helper, and resetting if a program was running) and types the MOUNT command. Images in other folders have to be moved to the root first.").weak().small());
+        ui.label(RichText::new("Copy files between this computer and the SD card in the MEGA65. Uploads go into one unbroken run of clusters when the card has room, which disk images need before the MEGA65 can mount them. A disk image (.d81, .d64, .d71, .d65) in any folder can be put on drive 8 with Mount on MEGA65: Studio resets the MEGA65 to the BASIC 65 prompt (stopping the helper; a running program is lost) and types CHDIR and MOUNT for it, so the card's working directory stays in that folder.").weak().small());
         ui.horizontal_wrapped(|ui| {
             ui.label("Transfer:");
             ui.radio_value(&mut self.s.sd_direct, false, "fast (helper program)").on_hover_text("runs mega65-tools' remotesd helper on the MEGA65; about 160 KB/s");
@@ -1848,15 +1851,12 @@ impl StudioApp {
                             }
                             if is_disk_image(&e.name) {
                                 let sector = self.sd.images.iter().find(|(n, _)| *n == e.name).map(|(_, s)| *s);
-                                let in_root = listed.trim_matches('/').is_empty();
-                                if in_root && sector.is_some() && sector == Some(self.sd.mounted[0]) {
+                                if sector.is_some() && sector == Some(self.sd.mounted[0]) {
                                     ui.label(RichText::new("▶ on drive 8").color(green).strong());
-                                } else if in_root && sector.is_some() && sector == Some(self.sd.mounted[1]) {
+                                } else if sector.is_some() && sector == Some(self.sd.mounted[1]) {
                                     ui.label(RichText::new("▶ on drive 9").color(green).strong());
-                                } else if !in_root {
-                                    ui.label(RichText::new("move to the root folder to mount").weak().small());
-                                } else if ui.add_enabled(en, egui::Button::new(RichText::new("Mount on MEGA65").strong())).on_hover_text("type MOUNT for this image at the BASIC 65 prompt, replacing what is on drive 8; a running program is stopped by the reset this needs").clicked() {
-                                    action = Some(SdOp::Mount { name: e.name.clone() });
+                                } else if ui.add_enabled(en, egui::Button::new(RichText::new("Mount on MEGA65").strong())).on_hover_text("reset to the BASIC 65 prompt and type CHDIR and MOUNT for this image, replacing what is on drive 8; a running program is lost").clicked() {
+                                    action = Some(SdOp::Mount { path: path.clone() });
                                 }
                             }
                         }
@@ -1898,12 +1898,12 @@ impl StudioApp {
             if ui.add_enabled(en, egui::Button::new("Refresh")).clicked() {
                 self.backend.send(Cmd::Hyppo);
             }
-            if self.sd.images.is_empty() {
-                ui.label(RichText::new("list the card's root folder in the SD card tab and mounted images are shown by name").weak().small());
+            if self.sd.root_images.is_empty() {
+                ui.label(RichText::new("list the card's root folder in the SD card tab and mounted images from it are shown by name").weak().small());
             }
         });
         if let Some((text, image0, image1, ctrl)) = self.drives.hyppo.clone() {
-            let name = |sector: u32| self.sd.images.iter().find(|(_, s)| *s == sector).map(|(n, _)| format!(" = {n}")).unwrap_or_default();
+            let name = |sector: u32| self.sd.root_images.iter().find(|(_, s)| *s == sector).map(|(n, _)| format!(" = {n}")).unwrap_or_default();
             for (drive, sector) in [(8, image0), (9, image1)] {
                 let what = if sector == 0 || sector == u32::MAX {
                     if drive == 8 && self.drives.serving.is_some() {

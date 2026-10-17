@@ -97,10 +97,10 @@ pub enum SdOp {
     /// Delete a file, or a directory with everything in it.
     Delete { path: String },
     Mkdir { path: String },
-    /// Put a disk image (D81/D64/D71/D65) from the card's root directory on
-    /// drive 8 by typing BASIC 65's MOUNT command at the READY prompt (after
-    /// stopping the SD helper and resetting if the MEGA65 is not there).
-    Mount { name: String },
+    /// Put a disk image (D81/D64/D71/D65) anywhere on the card on drive 8 by
+    /// typing BASIC 65's CHDIR and MOUNT commands at the READY prompt (after
+    /// stopping the SD helper and resetting). `path` is absolute on the card.
+    Mount { path: String },
     /// Stop the helper program and reset the MEGA65 to the BASIC 65 prompt.
     Quit,
 }
@@ -742,8 +742,8 @@ impl Worker {
             ctx.request_repaint();
         };
         let m = self.mach()?;
-        if let SdOp::Mount { name } = op {
-            return mount_image(m, name);
+        if let SdOp::Mount { path } = op {
+            return mount_image(m, path);
         }
         if direct {
             if matches!(op, SdOp::Quit) {
@@ -1042,31 +1042,31 @@ fn mounted_images(mon: &mut Monitor) -> mega65::Result<[u32; 2]> {
     Ok([at(0), at(4)])
 }
 
-/// Mount a root-directory image the way a user would: stop the SD helper if
-/// it is running, get the MEGA65 to the BASIC 65 prompt, type MOUNT, and
-/// check that the F011 image register now holds the file's first sector.
-/// The file is looked up through the direct SD path (a few sectors, with the
-/// CPU paused for a moment) so the check does not need the helper.
-fn mount_image(m: &mut Machine, name: &str) -> mega65::Result<SdResult> {
-    if !is_disk_image(name) {
+/// Mount an image the way a user would at the keyboard: stop the SD helper
+/// if it is running, reset to the BASIC 65 prompt, CHDIR into the image's
+/// folder and MOUNT it, then check that the F011 image register holds the
+/// file's first sector. The file is looked up through the direct SD path (a
+/// few sectors, with the CPU paused for a moment) so the check does not
+/// need the helper.
+fn mount_image(m: &mut Machine, path: &str) -> mega65::Result<SdResult> {
+    let name = path.rsplit('/').next().unwrap_or(path).to_string();
+    if !is_disk_image(&name) {
         return Err(mega65::Error::Other(format!("{name}: only .d81, .d64, .d71 and .d65 images can be mounted")));
     }
-    let helper_was_up = HelperSd::quit_if_resident(&mut m.mon)?;
-    if helper_was_up {
-        // The helper ran in C64 mode; MOUNT needs BASIC 65, so reset.
-        m.reset()?;
-    }
+    HelperSd::quit_if_resident(&mut m.mon)?;
     let want = {
         let mut fs = Fat32::open(DirectSd::new(&mut m.mon))?;
-        let e = fs.lookup(&format!("/{name}"))?.ok_or_else(|| mega65::Error::Other(format!("{name}: not found in the root folder")))?;
+        let e = fs.lookup(path)?.ok_or_else(|| mega65::Error::Other(format!("{path}: not found")))?;
         let want = fs.cluster_sector(e.cluster);
         fs.close()?;
         want
     };
     let before = mounted_images(&mut m.mon)?[0];
-    let after = m.mount_image(name)?;
+    let after = m.mount_image(path)?;
+    let folder = parent_dir(path);
     if after == want {
-        Ok(SdResult { message: format!("{name} is now drive 8; the MEGA65 is at the BASIC 65 prompt"), listing: None })
+        let note = if folder == "/" { String::new() } else { format!("; the card's working directory for LOAD and MOUNT is now {folder} (a reset puts it back at the root)") };
+        Ok(SdResult { message: format!("{name} is now drive 8; the MEGA65 is at the BASIC 65 prompt{note}"), listing: None })
     } else if after == before {
         Err(mega65::Error::Other(format!(
             "MOUNT did not take {name} (drive 8 is unchanged); look at the MEGA65's screen for the DOS error"

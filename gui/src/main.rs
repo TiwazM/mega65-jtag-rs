@@ -361,10 +361,10 @@ fn selftest_keys(device: String) {
     println!("cursor rows seen {rows:?}, columns seen {cols:?}");
 }
 
-/// `m65-studio --selftest-mount DEVICE NAME`: mount a disk image from the
-/// card's root folder through the worker, as the SD tab's Mount on MEGA65
-/// button does, and show what drive 8 holds before and after.
-fn selftest_mount(device: String, name: String) {
+/// `m65-studio --selftest-mount DEVICE /PATH/NAME.D81`: mount a disk image
+/// through the worker, as the SD tab's Mount on MEGA65 button does, and show
+/// what drive 8 holds before and after (named when the image is in the root).
+fn selftest_mount(device: String, path: String) {
     use backend::{Backend, Cmd, Event, SdOp};
     use std::time::{Duration, Instant};
     let b = Backend::start(egui::Context::default());
@@ -372,7 +372,7 @@ fn selftest_mount(device: String, name: String) {
     b.send(Cmd::Connect { device, baud: 2_000_000 });
     let sd = |op: SdOp| Cmd::Sd { op, direct: false, force: true };
     b.send(sd(SdOp::List { path: "/".into() }));
-    b.send(sd(SdOp::Mount { name }));
+    b.send(sd(SdOp::Mount { path }));
     b.send(sd(SdOp::List { path: "/".into() }));
     b.send(sd(SdOp::Quit));
     let start = Instant::now();

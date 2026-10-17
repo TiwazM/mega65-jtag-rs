@@ -476,28 +476,45 @@ impl Machine {
         Ok(HyppoStatus { text: t })
     }
 
-    /// Mount a disk image from the SD card's root folder as drive 8 by typing
-    /// BASIC 65's `MOUNT` command, so the machine stays in its native mode and
-    /// ends at the READY prompt with the image attached. The MEGA65 is reset
-    /// first unless it is already sitting at the BASIC 65 prompt, so a running
-    /// program is lost. Returns the F011 image register ($D68C) afterwards,
-    /// which holds the image's first sector when the mount took.
-    pub fn mount_image(&mut self, name: &str) -> Result<u32> {
-        if !self.at_basic65_prompt()? {
+    /// Mount a disk image on the SD card as drive 8 by typing BASIC 65's
+    /// commands, so the machine stays in its native mode and ends at the
+    /// READY prompt with the image attached: the MEGA65 is reset (unless it
+    /// is already at the prompt, which also puts the SD card's working
+    /// directory back at the root), then `CHDIR "folder",U12` for each folder
+    /// of `path` and `MOUNT "name"`. A running program is lost. The working
+    /// directory is left in the image's folder on purpose: the manual warns
+    /// that the ROM un-mounts an image from a subfolder when the directory
+    /// changes again, and a reset puts it back at the root anyway.
+    /// Returns the F011 image register ($D68C) afterwards, which holds the
+    /// image's first sector when the mount took.
+    pub fn mount_image(&mut self, path: &str) -> Result<u32> {
+        let mut parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+        let name = parts.pop().ok_or_else(|| Error::Other("mount: empty path".into()))?;
+        // Reset unless at the prompt with nothing typed since boot; a reset is
+        // the only way back to the root directory we can be sure of.
+        if !self.at_basic65_prompt()? || !parts.is_empty() {
             self.reset_to_prompt()?;
         }
         self.mode = Mode::C65;
-        self.stuff_keybuffer(&format!("mount \"{}\"\r", name.to_ascii_lowercase()))?;
-        // Give DOS a moment to open the file and tell the Hypervisor.
+        for dir in parts {
+            self.type_basic65_line(&format!("chdir \"{}\",u12", dir.to_ascii_lowercase()))?;
+        }
+        self.type_basic65_line(&format!("mount \"{}\"", name.to_ascii_lowercase()))?;
+        let r = self.mon.read_memory(0xffd368c, 4)?;
+        Ok(u32::from_le_bytes([r[0], r[1], r[2], r[3]]))
+    }
+
+    /// Type one line at the BASIC 65 prompt and wait for READY to come back
+    /// (up to 5 s; DOS commands take a moment).
+    fn type_basic65_line(&mut self, line: &str) -> Result<()> {
+        self.stuff_keybuffer(&format!("{line}\r"))?;
         let start = std::time::Instant::now();
         loop {
             std::thread::sleep(Duration::from_millis(250));
             if self.at_basic65_prompt()? || start.elapsed() > Duration::from_secs(5) {
-                break;
+                return Ok(());
             }
         }
-        let r = self.mon.read_memory(0xffd368c, 4)?;
-        Ok(u32::from_le_bytes([r[0], r[1], r[2], r[3]]))
     }
 
     /// Reset and wait until BASIC 65 is at its READY prompt. A mounted disk
