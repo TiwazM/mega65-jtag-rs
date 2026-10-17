@@ -260,7 +260,28 @@ The SD helper protocol, FAT32 layout and the Xilinx configuration sequence follo
 mega65-tools (`mega65_ftp.c`, `remotesd.c`, `fpgajtag`). The helper binary in
 `assets/remotesd.prg` is the GPL `remotesd` program from mega65-tools.
 
+## Acknowledgements
+
+This builds on the work of the MEGA65 community. In particular:
+
+* [mega65-tools](https://github.com/MEGA65/mega65-tools) (Paul Gardner-Stephen,
+  Oliver Graf, Gurce Isikyildiz and contributors, GPL-3): the `remotesd` SD helper
+  is included as is, the screen renderer is a Rust adaptation of `screen_shot.c`,
+  the disassembler's opcode table comes from `m65dbg`, and the SD, FAT32 and
+  monitor code follow `mega65_ftp` and `m65`.
+* fpgajtag (John Ankcorn, Quanta Research Cambridge, MIT): the JTAG configuration
+  sequence follows it.
+* The [MEGA65 User's Guide and Compendium](https://github.com/MEGA65/mega65-user-guide)
+  (GFDL): register maps, DMA lists, instruction set, BASIC 65.
+* [Xemu](https://github.com/lgblgblgb/xemu) (Gábor Lénárt and contributors, GPL-2+):
+  the emulator used as a second target; `docs/xemu-ai-poc` holds patches to it.
+* egui/eframe, serialport, rusb/libusb, png, clap and the rest of the Rust crates
+  this is built from.
+
+[CREDITS.md](CREDITS.md) lists what was taken from each project, how, and under
+which licence.
+
 ## License
 
-GPL-3.0-or-later, matching mega65-tools, whose protocols and helper program this
-reuses.
+GPL-3.0-or-later (see [LICENSE](LICENSE)), matching mega65-tools, whose protocols,
+renderer and helper program this reuses.
