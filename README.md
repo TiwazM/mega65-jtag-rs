@@ -166,9 +166,25 @@ macOS/Linux, `-uartmon :4510` on Windows; add `-besure` to skip its exit
 confirmation and `-headless` for windowless test runs) and connect to that socket or
 `tcp:localhost:4510`. Memory, registers, disassembly, screenshots, PRG loading
 and typing all work. Xemu's monitor has no `l` fast-load (writes go through `s`,
-so they're slower) and no `#` no-op, and the Xemu "next" builds from 2026 crash
-with SIGBUS when the CPU leaves trace mode, so `m65rs`/Studio refuse to resume
-after a halt or breakpoint on Xemu; restart Xemu instead.
+so they're slower) and no `#` no-op, and the stock Xemu "next" builds from 2026
+crash with SIGBUS when the CPU leaves trace mode with a window open, so
+`m65rs`/Studio refuse to resume after a halt or breakpoint on stock Xemu;
+restart Xemu instead.
+
+With the `ai-agent` Xemu build (four small patches in
+[docs/xemu-ai-poc](docs/xemu-ai-poc/README.md), which also has the analysis
+behind them) the picture changes: resume and Step work, memory reads are fast,
+`screenshot --png` is Xemu's own frame, and an AI agent or test script can drive
+a game frame by frame:
+
+```bash
+m65rs -l /tmp/xemu-umon.sock joy 2 left fire   # hold inputs on port 2
+m65rs -l /tmp/xemu-umon.sock frames 10 --fast  # run exactly 10 frames, then pause
+m65rs -l /tmp/xemu-umon.sock screenshot -p f.png
+m65rs -l /tmp/xemu-umon.sock joy 2 none
+```
+
+Studio shows "⏵ Frame" and "10 frames" buttons when it is connected to that build.
 
 ## Library
 
