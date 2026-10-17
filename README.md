@@ -182,7 +182,11 @@ builds the same on macOS, Windows and Linux):
   loader (Browse or drag a file onto the window), memory save, virtual keyboard,
   GO64 / PAL / NTSC;
 - tabs: two live hex memory views (click a byte to edit it), disassembly that
-  follows PC, screen capture (optionally on every poll, save as PNG), a
+  follows PC, screen capture (optionally on every poll, save as PNG; with
+  ⌨ Send keys on, clicking the screen makes the PC keyboard the MEGA65's:
+  cursor keys, RETURN, SPACE, TAB, letters, digits, F-keys and ESC = RUN/STOP
+  are held down on the MEGA65 for as long as you hold them, ⌘ shortcuts stay
+  with Studio, and clicking anywhere else stops it), a
   profiler (continuous PC sampling without stopping the CPU: hot-address table
   with click-to-disassemble, and a frame-rate graph from any byte that changes
   once per rendered frame, with a Find… button that locates such bytes), a

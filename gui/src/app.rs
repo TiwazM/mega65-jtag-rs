@@ -224,6 +224,9 @@ pub struct StudioApp {
     disasm_at: u32,
     screen_tex: Option<TextureHandle>,
     screen_text: String,
+    /// Screen tab: PC key presses go to the MEGA65 while the screen has focus.
+    send_keys: bool,
+    keys: crate::keys::KeyState,
     log: VecDeque<String>,
     console_in: String,
     break_in: String,
@@ -302,6 +305,8 @@ impl StudioApp {
             disasm_at: 0,
             screen_tex: None,
             screen_text: String::new(),
+            send_keys: false,
+            keys: Default::default(),
             log: VecDeque::new(),
             console_in: String::new(),
             break_in: String::new(),
@@ -964,6 +969,7 @@ impl StudioApp {
 
     fn screen_tab(&mut self, ui: &mut egui::Ui) {
         let en = self.connected && !self.busy;
+        let mut turned_on = false;
         ui.horizontal(|ui| {
             if ui.add_enabled(en, egui::Button::new("Capture")).clicked() {
                 self.backend.send(Cmd::Screenshot { pause: self.s.pause_for_screen });
@@ -980,14 +986,61 @@ impl StudioApp {
             if ui.add_enabled(!self.screen_text.is_empty(), egui::Button::new("Copy text")).clicked() {
                 ui.output_mut(|o| o.copied_text = self.screen_text.clone());
             }
+            ui.separator();
+            turned_on = ui
+                .add_enabled(self.connected, egui::Checkbox::new(&mut self.send_keys, "⌨ Send keys"))
+                .on_hover_text("while the screen below has focus, keys you press (cursor keys, RETURN, SPACE, TAB, letters, F-keys, ESC = RUN/STOP) are held on the MEGA65's keyboard; ⌘ shortcuts stay with Studio. Click the screen to send keys, click anywhere else to stop.")
+                .changed()
+                && self.send_keys;
         });
-        if let Some(t) = &self.screen_tex {
-            let avail = ui.available_size();
+        let avail = ui.available_size();
+        let resp = if let Some(t) = &self.screen_tex {
             let (w, h) = (t.size()[0] as f32, t.size()[1] as f32);
             let scale = (avail.x / w).min(avail.y / h).max(0.1);
-            ui.image((t.id(), egui::vec2(w * scale, h * scale)));
+            ui.add(egui::Image::new((t.id(), egui::vec2(w * scale, h * scale))).sense(egui::Sense::click()))
         } else {
-            ui.label(RichText::new("no capture yet").weak());
+            let size = if self.send_keys { egui::vec2(avail.x, avail.y.min(200.0)) } else { egui::vec2(avail.x, 20.0) };
+            let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+            ui.painter().text(rect.left_top(), egui::Align2::LEFT_TOP, "no capture yet", egui::FontId::proportional(14.0), ui.visuals().weak_text_color());
+            resp
+        };
+        let capturing = self.send_keys && self.connected && resp.has_focus();
+        if self.send_keys && self.connected && (turned_on || resp.clicked()) {
+            resp.request_focus();
+        }
+        if capturing {
+            // Keep Tab, arrows and Escape from moving focus away.
+            ui.memory_mut(|m| {
+                m.set_focus_lock_filter(resp.id, egui::EventFilter { tab: true, horizontal_arrows: true, vertical_arrows: true, escape: true })
+            });
+            let keys = &mut self.keys;
+            ui.input_mut(|i| {
+                i.events.retain(|e| match e {
+                    egui::Event::WindowFocused(false) => {
+                        keys.release_all();
+                        true
+                    }
+                    egui::Event::Text(_) => false,
+                    e => !keys.event(e),
+                })
+            });
+            ui.painter().rect_stroke(resp.rect.expand(2.0), 2.0, egui::Stroke::new(2.0_f32, Color32::from_rgb(90, 200, 120)));
+            ui.label(RichText::new("⌨ keys go to the MEGA65 (click outside the screen to stop)").color(Color32::from_rgb(90, 200, 120)).small());
+        } else {
+            self.keys.release_all();
+            if self.send_keys && self.connected {
+                ui.label(RichText::new("click the screen to send keys").weak().small());
+            }
+        }
+        self.sync_keys();
+    }
+
+    /// Tell the MEGA65 which keys are held, if that changed.
+    fn sync_keys(&mut self) {
+        if let Some(k) = self.keys.changed() {
+            if self.connected {
+                self.backend.send(Cmd::HoldKeys(k));
+            }
         }
     }
 
@@ -1981,6 +2034,10 @@ impl eframe::App for StudioApp {
                 Tab::Console => self.console_tab(ui),
             }
         });
+        if self.s.tab != Tab::Screen && !self.keys.is_empty() {
+            self.keys.release_all();
+            self.sync_keys();
+        }
     }
 }
 

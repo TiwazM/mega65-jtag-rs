@@ -16,6 +16,9 @@ pub const BASIC_ROM: u32 = 0x20000;
 pub const FLASH_MENU: u32 = 0x50000;
 /// Virtual keyboard registers: $D615..$D617 hold up to three pressed matrix keys.
 pub const VKEY_REG: u32 = 0xffd3615;
+/// Matrix scan codes of the shift keys. Cursor up/left are right shift + down/right.
+pub const KEY_LSHIFT: u8 = 0x0f;
+pub const KEY_RSHIFT: u8 = 0x34;
 /// Buffered UART ASCII input register.
 pub const UART_ASCII_IN: u32 = 0xffd30e3;
 
@@ -36,7 +39,7 @@ impl Mode {
 
 /// Which keyboard matrix position a key lives at (7 rows x 8 columns, $00-$3F).
 /// `None` for keys that aren't on the matrix.
-fn matrix_code(key: u8) -> Option<(u8, bool)> {
+pub fn matrix_code(key: u8) -> Option<(u8, bool)> {
     // Returns (code, needs_shift).
     let shifted = |c: u8| Some((c, true));
     let plain = |c: u8| Some((c, false));
@@ -272,6 +275,27 @@ impl Machine {
         self.mon.set_bytes(VKEY_REG, &[0x7f, 0x7f, 0x7f])?;
         std::thread::sleep(gap);
         Ok(())
+    }
+
+    /// Hold exactly these matrix keys down (scan codes; at most three), releasing any
+    /// others, until the next call. `prev` is what the last call held: a newly pressed
+    /// shift is written on its own first, as the scanner needs.
+    pub fn hold_keys(&mut self, prev: &[u8], keys: &[u8]) -> Result<()> {
+        let is_shift = |k: &u8| *k == KEY_LSHIFT || *k == KEY_RSHIFT;
+        let regs = |it: &mut dyn Iterator<Item = &u8>| {
+            let mut r = [0x7fu8; 3];
+            for (slot, &k) in r.iter_mut().zip(it) {
+                *slot = k;
+            }
+            r
+        };
+        let new_shift = keys.iter().any(|k| is_shift(k) && !prev.contains(k));
+        let new_other = keys.iter().any(|k| !is_shift(k) && !prev.contains(k));
+        if new_shift && new_other {
+            self.mon.set_bytes(VKEY_REG, &regs(&mut keys.iter().filter(|k| is_shift(k))))?;
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        self.mon.set_bytes(VKEY_REG, &regs(&mut keys.iter()))
     }
 
     /// Type a string via the virtual keyboard. See [`escape_key`] for `~` sequences.

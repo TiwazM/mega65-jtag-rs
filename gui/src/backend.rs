@@ -41,6 +41,9 @@ pub enum Cmd {
     LoadBinary { path: PathBuf, addr: u32 },
     SaveMemory { path: PathBuf, start: u32, end: u32, prg: bool, pause: bool },
     TypeText { text: String, ret: bool, buffer: bool },
+    /// Hold exactly these keyboard matrix keys down (scan codes, at most three)
+    /// until the next `HoldKeys`; an empty list releases everything.
+    HoldKeys(Vec<u8>),
     Raw(String),
     Reset,
     Go64,
@@ -211,6 +214,9 @@ struct Worker {
     watches: Vec<(u32, u8)>,
     search: Option<mega65::memsearch::Search>,
     vf011: Option<mega65::vf011::VirtualF011>,
+    /// Keys `HoldKeys` has down, and when they were last changed.
+    held_keys: Vec<u8>,
+    keys_changed: Instant,
 }
 
 impl Worker {
@@ -237,6 +243,8 @@ impl Worker {
             watches: Vec::new(),
             search: None,
             vf011: None,
+            held_keys: Vec::new(),
+            keys_changed: Instant::now(),
         }
     }
 
@@ -306,7 +314,11 @@ impl Worker {
             match self.rx.recv_timeout(wait) {
                 Ok(Cmd::Shutdown) => break,
                 Ok(cmd) => {
-                    self.emit(Event::Busy(true));
+                    // Key presses are frequent and quick; don't flash the UI busy.
+                    let quiet = matches!(cmd, Cmd::HoldKeys(_));
+                    if !quiet {
+                        self.emit(Event::Busy(true));
+                    }
                     if let Err(e) = self.handle(cmd) {
                         self.emit(Event::Error(e.to_string()));
                         // A dead link is the likeliest cause; verify with a sync.
@@ -317,7 +329,9 @@ impl Worker {
                             }
                         }
                     }
-                    self.emit(Event::Busy(false));
+                    if !quiet {
+                        self.emit(Event::Busy(false));
+                    }
                 }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break,
@@ -349,10 +363,16 @@ impl Worker {
                 let xemu_ext = m.mon.xemu_ext;
                 self.mach = Some(m);
                 self.last_regs = None;
+                self.held_keys.clear();
                 self.emit(Event::Connected { device, xemu, xemu_ext, versions });
                 self.refresh_all()?;
             }
             Cmd::Disconnect => {
+                if !std::mem::take(&mut self.held_keys).is_empty() {
+                    if let Some(m) = self.mach.as_mut() {
+                        let _ = m.hold_keys(&[], &[]);
+                    }
+                }
                 if self.vf011.take().is_some() {
                     if let Some(m) = self.mach.as_mut() {
                         let _ = mega65::vf011::VirtualF011::stop(m);
@@ -461,6 +481,22 @@ impl Worker {
                 } else {
                     m.type_text(&text, ret)?;
                 }
+            }
+            Cmd::HoldKeys(keys) => {
+                if keys == self.held_keys {
+                    return Ok(());
+                }
+                // A quick tap arrives as press and release back to back; keep each
+                // state long enough for the keyboard scanner to see it.
+                let min = Duration::from_millis(40);
+                let since = self.keys_changed.elapsed();
+                if since < min {
+                    std::thread::sleep(min - since);
+                }
+                let prev = std::mem::take(&mut self.held_keys);
+                self.mach()?.hold_keys(&prev, &keys)?;
+                self.held_keys = keys;
+                self.keys_changed = Instant::now();
             }
             Cmd::Raw(line) => {
                 let out = self.mach()?.mon.raw(&line)?;

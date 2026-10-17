@@ -2,6 +2,7 @@
 
 mod app;
 mod backend;
+mod keys;
 
 fn main() -> eframe::Result {
     // `m65-studio --selftest DEVICE` drives the worker thread without a window
@@ -17,6 +18,10 @@ fn main() -> eframe::Result {
     }
     if args.get(1).map(|a| a == "--selftest-vf011").unwrap_or(false) {
         selftest_vf011(args.get(2).cloned().unwrap_or_default(), args.get(3).cloned().unwrap_or_default());
+        return Ok(());
+    }
+    if args.get(1).map(|a| a == "--selftest-keys").unwrap_or(false) {
+        selftest_keys(args.get(2).cloned().unwrap_or_default());
         return Ok(());
     }
     if args.get(1).map(|a| a == "--selftest").unwrap_or(false) {
@@ -264,4 +269,74 @@ fn selftest_vf011(device: String, d81: String) {
     println!("{}", if reads > 0 { "VF011 SELFTEST PASSED" } else { "VF011 SELFTEST FAILED: the MEGA65 never asked for a sector" });
     let _ = writes;
     b.send(Cmd::Disconnect);
+}
+
+/// `m65-studio --selftest-keys DEVICE`: at a BASIC 65 READY prompt, press keys
+/// through the Screen tab's key path (egui key events -> `KeyState` ->
+/// `HoldKeys`): clears the screen, types `PRINT 1+2`, moves left onto the 1 and types 4, RETURN,
+/// then HOME, right onto the 4, 5 and RETURN (`PRINT 5+2`, 7), then cursor up twice
+/// (the cursor row printed should drop by 2).
+fn selftest_keys(device: String) {
+    use backend::{Backend, Cmd, Event};
+    use egui::Key;
+    use std::time::Duration;
+    let ctx = egui::Context::default();
+    let b = Backend::start(ctx);
+    b.send(Cmd::SetLive { enabled: false, interval: Duration::from_millis(500), screen: false });
+    b.send(Cmd::Connect { device, baud: 2_000_000 });
+    let mut keys = keys::KeyState::default();
+    let mut press = |key: Key, shift: bool| {
+        for pressed in [true, false] {
+            let e = egui::Event::Key { key, physical_key: Some(key), pressed, repeat: false, modifiers: egui::Modifiers { shift, ..Default::default() } };
+            assert!(keys.event(&e), "{key:?} not handled");
+            if let Some(k) = keys.changed() {
+                b.send(Cmd::HoldKeys(k));
+            }
+        }
+    };
+    press(Key::Home, true); // shift + HOME clears the screen
+    let typed = [Key::P, Key::R, Key::I, Key::N, Key::T, Key::Space, Key::Num1];
+    for k in typed {
+        press(k, false);
+    }
+    press(Key::Equals, true); // shift + = is + on a PC keyboard
+    press(Key::Num2, false);
+    for _ in 0..3 {
+        press(Key::ArrowLeft, false);
+    }
+    press(Key::Num4, false);
+    press(Key::Enter, false);
+    std::thread::sleep(Duration::from_secs(1)); // let BASIC print the result
+    // HOME goes back to the PRINT line (the screen was cleared); right six times
+    // onto the 4, make it 5 and run the line again.
+    press(Key::Home, false);
+    for _ in 0..6 {
+        press(Key::ArrowRight, false);
+    }
+    press(Key::Num5, false);
+    press(Key::Enter, false);
+    std::thread::sleep(Duration::from_secs(1));
+    // Cursor up twice: the cursor row ($EB) should drop by 2.
+    b.send(Cmd::Memory { id: 0, addr: 0xeb, len: 1 });
+    for _ in 0..2 {
+        press(Key::ArrowUp, false);
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    b.send(Cmd::Refresh);
+    b.send(Cmd::Screenshot { pause: false });
+    b.send(Cmd::Disconnect);
+    loop {
+        match b.rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(Event::Screen { text, .. }) => {
+                let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+                for l in lines.iter().rev().take(6).rev() {
+                    println!("| {}", l.trim_end());
+                }
+            }
+            Ok(Event::Memory { addr: 0xeb, data, .. }) => println!("cursor row {}", data[0]),
+            Ok(Event::Error(e)) => println!("error: {e}"),
+            Ok(Event::Disconnected) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
 }
