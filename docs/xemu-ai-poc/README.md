@@ -12,7 +12,7 @@ Live lock-step synchronisation of Xemu and the real machine is **not** practical
 
 What I did *not* do: no changes to the Rust code yet, no Xemu fork published, nothing irreversible. The Xemu work lives in a local clone at `~/src/xemu`, branch `ai-agent` (three commits on top of upstream `next`), and as the `0001`–`0003-*.patch` files next to this document.
 
-**Update, same day (step 1 of the plan, done):** the proof of concept became a proper branch. Three commits: (1) the windowed resume-crash fix, (2) the five monitor commands, (3) the monitor now executes every queued command and answers in the same frame, so a batch of 20 commands takes 6 ms instead of 800 ms and one agent "turn" (hold left 10 frames, release, run 20 frames, PNG, 1 frame) is a single 58 ms round trip in Space Commander. Regression test: [branch_test.py](branch_test.py), all passing headless. The crash fix itself still needs one short *windowed* run to confirm (see 2.1).
+**Update, same day (step 1 of the plan, done):** the proof of concept became a proper branch. Three commits: (1) the windowed resume-crash fix, (2) the five monitor commands, (3) the monitor now executes every queued command and answers in the same frame, so a batch of 20 commands takes 6 ms instead of 800 ms and one agent "turn" (hold left 10 frames, release, run 20 frames, PNG, 1 frame) is a single 58 ms round trip in Space Commander. Regression test: [branch_test.py](branch_test.py), all passing headless; the crash fix is confirmed windowed (see 2.1), so Go/Step can be enabled on Xemu in Studio once it detects this build.
 
 ---
 
@@ -43,7 +43,7 @@ Studio disables Go/Step on Xemu because the installed build dies with SIGBUS/SIG
 Two consequences, both confirmed:
 
 1. **With `-headless` there is no crash.** The dummy video driver gives a plain memory buffer, so the stale pointer stays valid. I paused, single-stepped and resumed the stock binary dozens of times headless; it never died. Since the agent should run Xemu headless anyway, this is free.
-2. The fix is in commit 1 of the branch: the pause loop now services SDL, the GUI and the monitor without closing the frame, so the window keeps showing the last complete frame while paused and the renderer's pixel pointer stays valid. It builds and passes the headless tests, but the crash only reproduces with a window, so it needs one short windowed run (about ten seconds: pause, step, resume) to be called confirmed. I have not done that because it would open a window on your screen.
+2. The fix is in commit 1 of the branch: the pause loop now services SDL, the GUI and the monitor without closing the frame, so the window keeps showing the last complete frame while paused and the renderer's pixel pointer stays valid. **Confirmed windowed** (with Steve's OK): the stock 11 Oct build died on the very first `t1` / step / `t0` sequence (new crash report `xmega65-2026-10-17-152832.ips`, same SIGSEGV in the renderer), the branch build survived three pause/step/resume rounds plus a breakpoint-and-resume and exited cleanly.
 
 ## 3. What was measured
 
