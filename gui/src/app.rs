@@ -60,6 +60,8 @@ struct Settings {
     sd_layout: SdLayout,
     /// Directory shown on the card.
     sd_path: String,
+    /// Drives tab: the D81 served from this computer as the internal drive.
+    vf011_path: String,
 }
 
 /// How uploads lay files out on the card (see `mega65::fat32::Allocation`).
@@ -132,6 +134,7 @@ impl Default for Settings {
             sd_force: false,
             sd_layout: SdLayout::Auto,
             sd_path: "/".into(),
+            vf011_path: String::new(),
         }
     }
 }
@@ -147,7 +150,24 @@ enum Tab {
     Dma,
     Basic,
     Sd,
+    Drives,
     Console,
+}
+
+/// The Drives tab: the Hypervisor's state and the virtual drive.
+#[derive(Default)]
+struct DrivesState {
+    hyppo: Option<(String, u32, u32, u8)>,
+    serving: Option<String>,
+    reads: u64,
+    writes: u64,
+    note: Option<String>,
+}
+
+/// The Disassembly tab showing a file from this computer instead of the machine.
+struct DisasmFile {
+    path: PathBuf,
+    lines: Vec<String>,
 }
 
 /// The SD card tab: the directory last listed and the transfer in progress.
@@ -158,6 +178,8 @@ struct SdState {
     entries: Vec<mega65::fat32::DirEntry>,
     /// (free clusters, total clusters, bytes per cluster) from the card.
     free: Option<(u64, u64, u64)>,
+    /// Disk images in the card's root and their first sectors, for naming mounts.
+    images: Vec<(String, u32)>,
     /// An operation is running on the worker.
     busy: bool,
     progress: Option<(u64, u64)>,
@@ -229,6 +251,10 @@ pub struct StudioApp {
     basic: BasicState,
     search: SearchState,
     sd: SdState,
+    drives: DrivesState,
+    disasm_file: Option<DisasmFile>,
+    disasm_file_addr: String,
+    fill_in: (String, String, String),
 }
 
 /// The BASIC tab: the loaded source, its tokenized preview and the last send.
@@ -303,6 +329,10 @@ impl StudioApp {
             basic: BasicState::default(),
             search: SearchState::default(),
             sd: SdState::default(),
+            drives: DrivesState::default(),
+            disasm_file: None,
+            disasm_file_addr: String::new(),
+            fill_in: (String::new(), String::new(), "00".into()),
         };
         app.watch_vals = vec![WatchState::default(); app.s.watches.len()];
         if !app.s.basic_path.is_empty() {
@@ -381,6 +411,7 @@ impl StudioApp {
                     self.sd.busy = false;
                     self.sd.listed = None;
                     self.sd.helper_up = false;
+                    self.drives.serving = None;
                     self.status = "not connected".into();
                     self.regs = None;
                     self.push_log("disconnected".into());
@@ -466,12 +497,24 @@ impl StudioApp {
                     self.stopped = true;
                     self.s.tab = Tab::Disassembly;
                 }
-                Event::SdListing { path, entries, free } => {
+                Event::SdListing { path, entries, free, images } => {
+                    if path.trim_matches('/').is_empty() {
+                        self.sd.images = images;
+                    }
                     self.s.sd_path = path.clone();
                     self.sd.listed = Some(path);
                     self.sd.entries = entries;
                     self.sd.free = free;
                     self.sd.confirm_delete = None;
+                }
+                Event::Hyppo { text, image0, image1, ctrl } => self.drives.hyppo = Some((text, image0, image1, ctrl)),
+                Event::Vf011 { serving, reads, writes, note } => {
+                    self.drives.serving = serving;
+                    self.drives.reads = reads;
+                    self.drives.writes = writes;
+                    if note.is_some() {
+                        self.drives.note = note;
+                    }
                 }
                 Event::SdProgress(p) => self.sd.progress = p,
                 Event::SdDone(r) => {
@@ -773,6 +816,23 @@ impl StudioApp {
             self.hex_grid(ui, if i == 0 { MEM_VIEW } else { MEM_VIEW_2 });
             ui.separator();
         }
+        let en = self.connected && !self.busy;
+        ui.horizontal(|ui| {
+            ui.label("Fill from");
+            ui.add(egui::TextEdit::singleline(&mut self.fill_in.0).desired_width(80.0).hint_text("start"));
+            ui.label("up to");
+            ui.add(egui::TextEdit::singleline(&mut self.fill_in.1).desired_width(80.0).hint_text("end (excluded)"));
+            ui.label("with byte");
+            ui.add(egui::TextEdit::singleline(&mut self.fill_in.2).desired_width(30.0).hint_text("00"));
+            if ui.add_enabled(en, egui::Button::new("Fill")).on_hover_text("write the byte to every address from start up to, but not including, end; addresses may be symbol names").clicked() {
+                match (self.addr(&self.fill_in.0), self.addr(&self.fill_in.1), u8::from_str_radix(self.fill_in.2.trim().trim_start_matches('$'), 16)) {
+                    (Ok(start), Ok(end), Ok(value)) if end > start => self.backend.send(Cmd::Fill { start, end, value }),
+                    (Ok(_), Ok(_), Ok(_)) => self.last_error = Some("fill: end must be after start".into()),
+                    (Err(e), _, _) | (_, Err(e), _) => self.last_error = Some(e),
+                    (_, _, Err(_)) => self.last_error = Some("fill: the byte must be two hex digits".into()),
+                }
+            }
+        });
     }
 
     fn hex_grid(&mut self, ui: &mut egui::Ui, id: usize) {
@@ -820,6 +880,36 @@ impl StudioApp {
         }
     }
 
+    /// Disassemble a PRG (or a raw binary at `addr`) from this computer.
+    fn disasm_open_file(&mut self, path: PathBuf, addr: Option<u32>) {
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                self.last_error = Some(format!("{}: {e}", path.display()));
+                return;
+            }
+        };
+        let (base, data) = match addr {
+            Some(a) => (a, &bytes[..]),
+            None if bytes.len() >= 2 => (u16::from_le_bytes([bytes[0], bytes[1]]) as u32, &bytes[2..]),
+            None => {
+                self.last_error = Some(format!("{}: too short for a PRG", path.display()));
+                return;
+            }
+        };
+        self.auto_symbols_for(&path);
+        let syms = self.symbols.clone();
+        let mut lines = Vec::new();
+        for i in mega65::disasm::disassemble(base, data) {
+            for n in syms.names_at(i.addr & 0xffff) {
+                lines.push(format!("{n}:"));
+            }
+            lines.push(i.format_with(false, Some(&syms)));
+        }
+        self.push_log(format!("disassembled {} ({} bytes from ${base:04X}, {} lines)", path.display(), data.len(), lines.len()));
+        self.disasm_file = Some(DisasmFile { path, lines });
+    }
+
     fn disasm_tab(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             if ui.checkbox(&mut self.s.disasm_follow, "Follow PC").changed() {
@@ -832,7 +922,35 @@ impl StudioApp {
                 }
             });
             ui.label(RichText::new(format!("at ${:07X}", self.disasm_at)).weak());
+            ui.separator();
+            if ui.button("Disassemble file…").on_hover_text("read a PRG from this computer and disassemble it here; no MEGA65 needed. A .sym/.vs/.lbl file next to it is used for labels").clicked() {
+                if let Some(p) = rfd::FileDialog::new().add_filter("PRG / binary", &["prg", "PRG", "bin", "BIN"]).add_filter("All files", &["*"]).pick_file() {
+                    let is_prg = p.extension().map(|e| e.eq_ignore_ascii_case("prg")).unwrap_or(false);
+                    let addr = if is_prg { None } else { parse_hex(&self.disasm_file_addr).ok() };
+                    if !is_prg && addr.is_none() {
+                        self.last_error = Some("give the load address (hex) for a raw binary".into());
+                    } else {
+                        self.disasm_open_file(p, addr);
+                    }
+                }
+            }
+            ui.add(egui::TextEdit::singleline(&mut self.disasm_file_addr).desired_width(60.0).hint_text("bin addr")).on_hover_text("load address for a raw .bin; PRG files carry their own");
+            if let Some(f) = &self.disasm_file {
+                ui.label(RichText::new(format!("showing {} ({} lines)", f.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), f.lines.len())).weak());
+                if ui.button("Back to the MEGA65").clicked() {
+                    self.disasm_file = None;
+                }
+            }
         });
+        if let Some(f) = &self.disasm_file {
+            let row = ui.text_style_height(&egui::TextStyle::Monospace);
+            egui::ScrollArea::both().id_salt("disasm_file").show_rows(ui, row, f.lines.len(), |ui, range| {
+                for line in &f.lines[range] {
+                    ui.label(RichText::new(line).monospace());
+                }
+            });
+            return;
+        }
         egui::ScrollArea::both().show(ui, |ui| {
             let pc = self.regs.as_ref().map(|r| r.pc);
             for line in self.disasm.lines() {
@@ -1700,6 +1818,76 @@ impl StudioApp {
         }
     }
 
+    fn drives_tab(&mut self, ui: &mut egui::Ui) {
+        let en = self.connected && !self.busy;
+        ui.heading("Hypervisor");
+        ui.label(RichText::new("What the MEGA65's Hypervisor has mounted and what its DOS is doing. Reading it is cheap and does not stop the CPU.").weak().small());
+        ui.horizontal(|ui| {
+            if ui.add_enabled(en, egui::Button::new("Refresh")).clicked() {
+                self.backend.send(Cmd::Hyppo);
+            }
+            if self.sd.images.is_empty() {
+                ui.label(RichText::new("list the card's root folder in the SD card tab and mounted images are shown by name").weak().small());
+            }
+        });
+        if let Some((text, image0, image1, ctrl)) = self.drives.hyppo.clone() {
+            let name = |sector: u32| self.sd.images.iter().find(|(_, s)| *s == sector).map(|(n, _)| format!(" = {n}")).unwrap_or_default();
+            for (drive, sector) in [(8, image0), (9, image1)] {
+                let what = if sector == 0 || sector == u32::MAX {
+                    if drive == 8 && self.drives.serving.is_some() {
+                        "served from this computer".to_string()
+                    } else {
+                        "no disk image mounted (real floppy, or nothing)".to_string()
+                    }
+                } else {
+                    format!("disk image starting at SD sector {sector}{}", name(sector))
+                };
+                ui.label(RichText::new(format!("Drive {drive}: {what}")).strong());
+            }
+            ui.label(RichText::new(format!("F011 control $D68B = ${ctrl:02X}")).weak().small());
+            egui::CollapsingHeader::new("DOS status").default_open(false).show(ui, |ui| {
+                egui::ScrollArea::vertical().id_salt("hyppo").max_height(300.0).show(ui, |ui| {
+                    ui.label(RichText::new(text).monospace().small());
+                });
+            });
+        } else if self.connected {
+            ui.label(RichText::new("press Refresh").weak());
+        }
+        ui.separator();
+        ui.heading("Virtual drive");
+        ui.label(RichText::new("Serve a D81 file from this computer as the MEGA65's internal drive: the Hypervisor sends each sector request over the serial link and Studio answers it. Slow (a few sectors per second) but nothing needs copying to the card, and writes go straight into the file. Starting and stopping both restart the MEGA65, because the Hypervisor only takes the drive on and off at boot, so anything in memory is lost. Don't press the reset button while serving: after that the MEGA65 needs a power cycle before a virtual drive works again.").weak().small());
+        ui.horizontal(|ui| {
+            ui.add(egui::TextEdit::singleline(&mut self.s.vf011_path).desired_width(300.0).hint_text("disk.d81"));
+            if ui.button("Browse…").clicked() {
+                if let Some(p) = rfd::FileDialog::new().add_filter("D81 disk image", &["d81", "D81"]).pick_file() {
+                    self.s.vf011_path = p.display().to_string();
+                }
+            }
+            match &self.drives.serving {
+                None => {
+                    if ui.add_enabled(en && !self.s.vf011_path.is_empty(), egui::Button::new(RichText::new("Start serving (restarts the MEGA65)").strong())).clicked() {
+                        self.drives.note = None;
+                        self.backend.send(Cmd::Vf011(Some(PathBuf::from(&self.s.vf011_path))));
+                    }
+                }
+                Some(_) => {
+                    if ui.add_enabled(en, egui::Button::new("Stop (restarts the MEGA65)")).on_hover_text("hand the drive back to the SD card; the MEGA65 restarts so the Hypervisor mounts its usual disk again").clicked() {
+                        self.backend.send(Cmd::Vf011(None));
+                    }
+                }
+            }
+        });
+        if let Some(p) = &self.drives.serving {
+            ui.label(RichText::new(format!("serving {p} as drive 8: {} reads, {} writes", self.drives.reads, self.drives.writes)).color(Color32::from_rgb(90, 190, 90)));
+            ui.label(RichText::new("Other Studio features keep working, but each request waits for the current poll to finish; turn Live off in the toolbar for the fastest drive.").weak().small());
+        } else if self.drives.reads + self.drives.writes > 0 {
+            ui.label(RichText::new(format!("stopped after {} reads, {} writes", self.drives.reads, self.drives.writes)).weak());
+        }
+        if let Some(n) = &self.drives.note {
+            ui.label(RichText::new(n).color(Color32::from_rgb(220, 170, 60)));
+        }
+    }
+
     fn console_tab(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label(RichText::new("monitor>").monospace());
@@ -1775,6 +1963,7 @@ impl eframe::App for StudioApp {
                 ui.selectable_value(&mut self.s.tab, Tab::Dma, "DMA");
                 ui.selectable_value(&mut self.s.tab, Tab::Basic, "BASIC");
                 ui.selectable_value(&mut self.s.tab, Tab::Sd, if self.sd.busy { "SD card ●" } else { "SD card" });
+                ui.selectable_value(&mut self.s.tab, Tab::Drives, if self.drives.serving.is_some() { "Drives ●" } else { "Drives" });
                 ui.selectable_value(&mut self.s.tab, Tab::Console, "Console / Log");
             });
             ui.separator();
@@ -1788,6 +1977,7 @@ impl eframe::App for StudioApp {
                 Tab::Dma => self.dma_tab(ui),
                 Tab::Basic => self.basic_tab(ui),
                 Tab::Sd => self.sd_tab(ui),
+                Tab::Drives => self.drives_tab(ui),
                 Tab::Console => self.console_tab(ui),
             }
         });

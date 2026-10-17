@@ -79,11 +79,34 @@ pub struct Monitor {
     /// Bytes that arrived ahead of whatever `read_until` was waiting for; the SD
     /// helper's "FTBATCHDONE" can land here while an upload is in progress.
     pub stray: Vec<u8>,
+    /// While a virtual F011 drive is served, pull its sector requests
+    /// (`<track|$80><sector|$80><side|$80>` then `!` or `\`) out of the input
+    /// as they arrive, whatever command is in progress, so none is lost inside
+    /// another command's reply. Monitor text never has the high bit set, so
+    /// the pattern is unambiguous; raw SD data streams are, so this is off
+    /// unless a drive is being served.
+    pub capture_vf011: bool,
+    /// Requests captured so far, oldest first.
+    pub vf011_requests: Vec<[u8; 4]>,
 }
 
 impl Monitor {
     pub fn new(t: Box<dyn Transport>) -> Self {
-        Self { t, rx: Vec::new(), rx_buffered: true, cpu_stopped: false, xemu: false, xemu_ext: false, pace_writes: false, debug: false, events: Vec::new(), stray: Vec::new(), load_without_halt: false }
+        Self {
+            t,
+            rx: Vec::new(),
+            rx_buffered: true,
+            cpu_stopped: false,
+            xemu: false,
+            xemu_ext: false,
+            pace_writes: false,
+            debug: false,
+            events: Vec::new(),
+            stray: Vec::new(),
+            load_without_halt: false,
+            capture_vf011: false,
+            vf011_requests: Vec::new(),
+        }
     }
 
     /// Open the transport and synchronise with the monitor.
@@ -131,9 +154,30 @@ impl Monitor {
             if self.debug {
                 eprintln!("<< {:?}", String::from_utf8_lossy(&buf[..n]));
             }
+            let before = self.rx.len();
             self.rx.extend_from_slice(&buf[..n]);
+            if self.capture_vf011 {
+                self.extract_vf011_requests(before.saturating_sub(3));
+            }
         }
         Ok(n)
+    }
+
+    /// Move virtual F011 requests found in `rx` from `from` on into
+    /// `vf011_requests`. A request split across two reads is caught by
+    /// starting a few bytes back.
+    fn extract_vf011_requests(&mut self, from: usize) {
+        let mut i = from;
+        while i + 4 <= self.rx.len() {
+            let r = &self.rx[i..i + 4];
+            if r[0] & r[1] & r[2] & 0x80 != 0 && (r[3] == b'!' || r[3] == b'\\') {
+                let req = [r[0], r[1], r[2], r[3]];
+                self.vf011_requests.push(req);
+                self.rx.drain(i..i + 4);
+            } else {
+                i += 1;
+            }
+        }
     }
 
     /// Discard pending input, keeping note of any breakpoint reports in it.

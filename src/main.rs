@@ -992,9 +992,11 @@ fn run(cmd: Cmd, mut mach: Machine, syms: &mega65::symbols::SymbolTable) -> anyh
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let s2 = stop.clone();
             let _ = ctrlc_handler(move || s2.store(true, std::sync::atomic::Ordering::SeqCst));
-            mega65::vf011::VirtualF011::enable(&mut mach.mon)?;
+            eprintln!("restarting the MEGA65 with the virtual drive attached");
+            mega65::vf011::VirtualF011::start(&mut mach)?;
             let r = vf.serve(&mut mach.mon, || stop.load(std::sync::atomic::Ordering::SeqCst));
-            mega65::vf011::VirtualF011::disable(&mut mach.mon)?;
+            eprintln!("restarting the MEGA65 with the SD card's drive again");
+            mega65::vf011::VirtualF011::stop(&mut mach)?;
             println!("{} reads, {} writes", vf.reads, vf.writes);
             r?;
         }

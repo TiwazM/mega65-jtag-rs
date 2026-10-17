@@ -15,6 +15,10 @@ fn main() -> eframe::Result {
         selftest_sd(args.get(2).cloned().unwrap_or_default(), args.get(3).cloned(), args.get(4).map(|a| a == "direct").unwrap_or(false));
         return Ok(());
     }
+    if args.get(1).map(|a| a == "--selftest-vf011").unwrap_or(false) {
+        selftest_vf011(args.get(2).cloned().unwrap_or_default(), args.get(3).cloned().unwrap_or_default());
+        return Ok(());
+    }
     if args.get(1).map(|a| a == "--selftest").unwrap_or(false) {
         selftest(args.get(2).cloned().unwrap_or_default());
         return Ok(());
@@ -38,6 +42,8 @@ fn selftest(device: String) {
         Cmd::Refresh,
         Cmd::Screenshot { pause: false },
         Cmd::WriteBytes { addr: 0x400, data: vec![1, 2, 3] },
+        Cmd::Fill { start: 0x7f8, end: 0x800, value: 0x20 },
+        Cmd::Hyppo,
         Cmd::Raw("r".into()),
     ];
     for c in script {
@@ -73,6 +79,7 @@ fn selftest(device: String) {
                         done = true;
                     }
                     Event::Search { count, hits, history, .. } => println!("Search: {count} hits, first {:?}, last step {:?}", hits.first(), history.last()),
+                    Event::Hyppo { text, image0, image1, ctrl } => println!("Hyppo: image0 sector {image0}, image1 sector {image1}, $D68B=${ctrl:02X}, {} lines of status", text.lines().count()),
                     Event::Progress(_) => {}
                     other => println!("{other:?}"),
                 }
@@ -152,7 +159,7 @@ fn selftest_sd(device: String, file: Option<String>, direct: bool) {
     let limit = Duration::from_secs(if direct { 1800 } else { 120 });
     while start.elapsed() < limit && ops_left > 0 {
         match b.rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(Event::SdListing { path, entries, free }) => {
+            Ok(Event::SdListing { path, entries, free, .. }) => {
                 println!("listing {path}: {} entries, free {free:?}", entries.len());
                 for e in entries.iter().take(12) {
                     println!("  {:>10} | {} | {}", if e.is_dir() { "<DIR>".to_string() } else { e.size.to_string() }, e.mtime, e.name);
@@ -202,5 +209,59 @@ fn selftest_sd(device: String, file: Option<String>, direct: bool) {
     } else if !failed {
         println!("SD SELFTEST PASSED");
     }
+    b.send(Cmd::Disconnect);
+}
+
+/// `m65-studio --selftest-vf011 DEVICE FILE.D81`: serve the image as the
+/// internal drive through the worker (which restarts the MEGA65), type DIR
+/// once it has booted, and report how many sectors it asked for.
+fn selftest_vf011(device: String, d81: String) {
+    use backend::{Backend, Cmd, Event};
+    use std::time::{Duration, Instant};
+    let b = Backend::start(egui::Context::default());
+    b.send(Cmd::Connect { device, baud: 2_000_000 });
+    b.send(Cmd::Vf011(Some(std::path::PathBuf::from(&d81))));
+    let start = Instant::now();
+    let (mut reads, mut writes) = (0, 0);
+    let (mut typed, mut shot, mut stopped) = (false, false, false);
+    while start.elapsed() < Duration::from_secs(70) {
+        // Give the Hypervisor and ROM time to boot before typing.
+        if start.elapsed() > Duration::from_secs(15) && !typed {
+            b.send(Cmd::TypeText { text: "dir".into(), ret: true, buffer: true });
+            typed = true;
+        }
+        if start.elapsed() > Duration::from_secs(40) && !shot {
+            b.send(Cmd::Screenshot { pause: false });
+            shot = true;
+        }
+        if start.elapsed() > Duration::from_secs(50) && !stopped {
+            b.send(Cmd::Vf011(None));
+            stopped = true;
+        }
+        match b.rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(Event::Vf011 { serving, reads: r, writes: w, note }) => {
+                reads = r;
+                writes = w;
+                println!("vf011: serving={serving:?} reads={r} writes={w} note={note:?}");
+                if stopped && serving.is_none() {
+                    break;
+                }
+            }
+            Ok(Event::Screen { text, .. }) => {
+                println!("--- screen while serving ---");
+                for l in text.lines().filter(|l| !l.trim().is_empty()) {
+                    println!("{}", l.trim_end());
+                }
+                println!("---");
+            }
+            Ok(Event::Error(e)) => println!("error: {e}"),
+            Ok(Event::Log(l)) => println!("log: {l}"),
+            Ok(_) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(_) => break,
+        }
+    }
+    println!("{}", if reads > 0 { "VF011 SELFTEST PASSED" } else { "VF011 SELFTEST FAILED: the MEGA65 never asked for a sector" });
+    let _ = writes;
     b.send(Cmd::Disconnect);
 }

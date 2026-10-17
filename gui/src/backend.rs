@@ -72,6 +72,15 @@ pub enum Cmd {
     /// mega65-tools helper program is put in C64 memory and stays resident
     /// until `SdOp::Quit`. `force` lets the helper replace a loaded program.
     Sd { op: SdOp, direct: bool, force: bool },
+    /// Read the Hypervisor's DOS state and the F011 disk-image registers.
+    Hyppo,
+    /// Fill `[start, end)` with a byte.
+    Fill { start: u32, end: u32, value: u8 },
+    /// Serve this D81 from the PC as the internal drive (virtual F011), or
+    /// stop serving with None. Starting restarts the MEGA65 so the Hypervisor
+    /// boots with the drive attached; requests are answered between other
+    /// commands.
+    Vf011(Option<PathBuf>),
     Shutdown,
 }
 
@@ -120,20 +129,31 @@ pub enum Event {
     /// Memory search state after a step: how many addresses match, the first
     /// `hits.len()` of them, the width, and the step history.
     Search { count: usize, hits: Vec<mega65::memsearch::Hit>, width: u8, history: Vec<String> },
-    /// A directory of the SD card, with (free, total, bytes per cluster) if known.
-    SdListing { path: String, entries: Vec<DirEntry>, free: Option<(u64, u64, u64)> },
+    /// A directory of the SD card, with (free, total, bytes per cluster) if
+    /// known, and the first sector of each disk image in it (name, sector), so
+    /// the Drives tab can name what the Hypervisor has mounted.
+    SdListing { path: String, entries: Vec<DirEntry>, free: Option<(u64, u64, u64)>, images: Vec<(String, u32)> },
     /// Transfer progress (done, total bytes), or None when finished.
     SdProgress(Option<(u64, u64)>),
     /// An SD operation finished: a one-line summary, or why it failed.
     SdDone(Result<String, String>),
+    /// Hypervisor state: the DOS status text, the F011 disk image start
+    /// sectors for drives 0 and 1 (0 or $FFFFFFFF = none), and the raw $D68B control byte.
+    Hyppo { text: String, image0: u32, image1: u32, ctrl: u8 },
+    /// Virtual drive state: the image being served (None = stopped), the
+    /// request counts, and a note when something notable happened.
+    Vf011 { serving: Option<String>, reads: u64, writes: u64, note: Option<String> },
 }
 
 /// What an SD operation produced: a line for the user and, when the directory
 /// shown may have changed, its fresh listing.
 struct SdResult {
     message: String,
-    listing: Option<(String, Vec<DirEntry>, Option<(u64, u64, u64)>)>,
+    listing: Option<SdDir>,
 }
+
+/// A listed directory: path, entries, free space, (name, first sector) of its disk images.
+type SdDir = (String, Vec<DirEntry>, Option<(u64, u64, u64)>, Vec<(String, u32)>);
 
 /// Hits sent to the UI per search step; the count is always exact.
 const SEARCH_HITS_SHOWN: usize = 1000;
@@ -190,6 +210,7 @@ struct Worker {
     symbols: std::sync::Arc<mega65::symbols::SymbolTable>,
     watches: Vec<(u32, u8)>,
     search: Option<mega65::memsearch::Search>,
+    vf011: Option<mega65::vf011::VirtualF011>,
 }
 
 impl Worker {
@@ -215,6 +236,7 @@ impl Worker {
             symbols: Default::default(),
             watches: Vec::new(),
             search: None,
+            vf011: None,
         }
     }
 
@@ -245,6 +267,34 @@ impl Worker {
                     }
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
                     Err(_) => {}
+                }
+                continue;
+            }
+            if self.vf011.is_some() && self.mach.is_some() {
+                // The virtual drive owns the link between commands: answer
+                // requests for a while, then look for commands, and repeat.
+                if let Err(e) = self.vf011_burst() {
+                    self.emit(Event::Error(format!("virtual drive: {e}")));
+                    self.vf011 = None;
+                    self.emit(Event::Vf011 { serving: None, reads: 0, writes: 0, note: Some(format!("stopped: {e}")) });
+                }
+                match self.rx.try_recv() {
+                    Ok(Cmd::Shutdown) => break,
+                    Ok(cmd) => {
+                        self.emit(Event::Busy(true));
+                        if let Err(e) = self.handle(cmd) {
+                            self.emit(Event::Error(e.to_string()));
+                        }
+                        self.emit(Event::Busy(false));
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                    Err(_) => {}
+                }
+                if self.live && self.mach.is_some() && self.last_poll.elapsed() >= self.interval {
+                    if let Err(e) = self.poll() {
+                        self.emit(Event::Error(e.to_string()));
+                    }
+                    self.last_poll = Instant::now();
                 }
                 continue;
             }
@@ -303,6 +353,12 @@ impl Worker {
                 self.refresh_all()?;
             }
             Cmd::Disconnect => {
+                if self.vf011.take().is_some() {
+                    if let Some(m) = self.mach.as_mut() {
+                        let _ = mega65::vf011::VirtualF011::stop(m);
+                    }
+                    self.emit(Event::Vf011 { serving: None, reads: 0, writes: 0, note: None });
+                }
                 self.mach = None;
                 self.emit(Event::Disconnected);
             }
@@ -529,13 +585,26 @@ impl Worker {
                 // The profiler would fight the transfer for the link; pause it.
                 let was = self.prof_on;
                 self.prof_on = false;
+                let serving = self.vf011.is_some();
+                if serving {
+                    // Raw sector data would look like drive requests; the drive waits.
+                    self.log("note: the virtual drive cannot answer requests during an SD card operation");
+                    if let Some(m) = self.mach.as_mut() {
+                        m.mon.capture_vf011 = false;
+                    }
+                }
                 let r = self.sd(&op, direct, force);
+                if serving {
+                    if let Some(m) = self.mach.as_mut() {
+                        m.mon.capture_vf011 = true;
+                    }
+                }
                 self.prof_on = was;
                 self.emit(Event::SdProgress(None));
                 match r {
                     Ok(res) => {
-                        if let Some((path, entries, free)) = res.listing {
-                            self.emit(Event::SdListing { path, entries, free });
+                        if let Some((path, entries, free, images)) = res.listing {
+                            self.emit(Event::SdListing { path, entries, free, images });
                         }
                         if !res.message.is_empty() {
                             self.log(format!("SD: {}", res.message));
@@ -553,7 +622,56 @@ impl Worker {
                     }
                 }
             }
+            Cmd::Hyppo => {
+                let m = self.mach()?;
+                let text = m.hyppo_status()?.text;
+                let regs = m.mon.read_memory(0xffd368b, 9)?;
+                let image0 = u32::from_le_bytes([regs[1], regs[2], regs[3], regs[4]]);
+                let image1 = u32::from_le_bytes([regs[5], regs[6], regs[7], regs[8]]);
+                self.emit(Event::Hyppo { text, image0, image1, ctrl: regs[0] });
+            }
+            Cmd::Fill { start, end, value } => {
+                if end <= start {
+                    return Err(mega65::Error::Other("fill: end must be after start".into()));
+                }
+                self.mach()?.mon.fill_memory(start, end, value)?;
+                self.log(format!("filled ${start:07X}-${end:07X} with ${value:02X}"));
+                self.refresh_views()?;
+            }
+            Cmd::Vf011(path) => {
+                if let Some(vf) = self.vf011.take() {
+                    let m = self.mach()?;
+                    mega65::vf011::VirtualF011::stop(m)?;
+                    self.log(format!("virtual drive stopped after {} reads, {} writes; the MEGA65 restarted with the SD card's drive", vf.reads, vf.writes));
+                    self.emit(Event::Vf011 { serving: None, reads: vf.reads, writes: vf.writes, note: None });
+                }
+                if let Some(p) = path {
+                    let vf = mega65::vf011::VirtualF011::open(&p.display().to_string())?;
+                    let m = self.mach()?;
+                    mega65::vf011::VirtualF011::start(m)?;
+                    self.log(format!("restarted the MEGA65 with {} as the internal drive", p.display()));
+                    self.emit(Event::Vf011 { serving: Some(p.display().to_string()), reads: 0, writes: 0, note: None });
+                    self.vf011 = Some(vf);
+                }
+            }
             Cmd::Shutdown => {}
+        }
+        Ok(())
+    }
+
+    /// Answer virtual-drive requests for up to 150 ms and report the counts
+    /// when anything happened.
+    fn vf011_burst(&mut self) -> mega65::Result<()> {
+        let Some(mut vf) = self.vf011.take() else { return Ok(()) };
+        let m = self.mach()?;
+        let served = vf.poll(&mut m.mon, Duration::from_millis(150))?;
+        let reset = served.contains(&mega65::vf011::Served::Reset);
+        if !served.is_empty() {
+            let note = reset.then(|| "the MEGA65 was reset: it needs a power cycle before the virtual drive works again; stopped serving".to_string());
+            self.emit(Event::Vf011 { serving: if reset { None } else { Some(vf.path.clone()) }, reads: vf.reads, writes: vf.writes, note });
+        }
+        if !reset {
+            self.vf011 = Some(vf);
         }
         Ok(())
     }
@@ -799,10 +917,15 @@ impl Worker {
 
 /// The filesystem side of an SD operation, the same for either block device.
 fn sd_op<D: BlockDevice>(fs: &mut Fat32<D>, op: &SdOp, progress: &mut impl FnMut(u64, u64)) -> mega65::Result<SdResult> {
-    let listing = |fs: &mut Fat32<D>, path: &str| -> mega65::Result<(String, Vec<DirEntry>, Option<(u64, u64, u64)>)> {
+    let listing = |fs: &mut Fat32<D>, path: &str| -> mega65::Result<SdDir> {
         let entries = fs.list(Some(path), false)?;
         let free = fs.df(false).ok();
-        Ok((path.to_string(), entries, free))
+        let images = entries
+            .iter()
+            .filter(|e| !e.is_dir() && e.cluster >= 2 && e.name.to_ascii_lowercase().ends_with(".d81"))
+            .map(|e| (e.name.clone(), fs.cluster_sector(e.cluster)))
+            .collect();
+        Ok((path.to_string(), entries, free, images))
     };
     let join = |dir: &str, name: &str| if dir.ends_with('/') { format!("{dir}{name}") } else { format!("{dir}/{name}") };
     match op {

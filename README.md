@@ -52,7 +52,7 @@ Screen and input:
 | `type TEXT [-r] [--buffer]` | type via the virtual keyboard matrix (works in games); `--buffer` stuffs the KERNAL buffer instead. `~M` RETURN, `~C` RUN/STOP, `~D ~U ~L ~R` cursors, `~H` HOME, `~T` DEL, `~1 ~3 ~5 ~7` F-keys, `~z` pause |
 | `go64` / `pal` / `ntsc` | mode switches |
 | `hyppo` | Hypervisor DOS/process state |
-| `vf011 IMAGE.D81` | serve a local D81 as the internal drive |
+| `vf011 IMAGE.D81` | serve a local D81 as the internal drive (restarts the MEGA65 to attach and detach it) |
 
 SD card (`m65rs sd ...`): `dir [PATH] [-a]`, `get`, `put`, `del [-r]`, `mkdir`,
 `rename`, `df [--scan]`, `info`, `sector N`, `clusters FILE`, `mount NAME.D81`.
@@ -201,15 +201,21 @@ builds the same on macOS, Windows and Linux):
   `m65rs sd put`, with the choice shown as three radio buttons, and report
   whether the file landed in one piece; fast mode runs the mega65-tools helper
   on the MEGA65 and Leave SD mode returns it to BASIC, gentle mode drives the SD
-  registers directly, slowly, pausing the CPU only during each transfer), and a
-  console for raw monitor commands with the log. Addresses typed anywhere may
-  be symbol names, and disassembly shows labels.
+  registers directly, slowly, pausing the CPU only during each transfer), a
+  Drives tab (the Hypervisor's mounted disk images, named when the SD card
+  tab has listed the root, its DOS status, and a virtual drive that serves a
+  D81 from the PC as drive 8 the way `m65rs vf011` does, answering requests
+  between Studio's other commands), and a console for raw monitor commands
+  with the log. The Memory tab has a Fill row, and the Disassembly tab's
+  Disassemble file… shows a PRG from the PC without a MEGA65. Addresses typed
+  anywhere may be symbol names, and disassembly shows labels.
 
 `m65-studio --selftest-sd DEVICE [FILE] [direct]` exercises the SD tab's worker
 path without a window: list the root, and with a file, upload it to a
 `STUDIOTEST` folder, download it back, compare, and delete the folder. On Xemu
 only `direct` works, because the helper's serial replies go to Xemu's log, not
-to the monitor socket.
+to the monitor socket. `--selftest-vf011 DEVICE FILE.D81` serves the image and
+types DIR at the READY prompt, reporting how many sectors were asked for.
 
 All hardware traffic runs on one worker thread, so the UI never blocks and
 panels can't interleave commands. Settings persist between runs.
@@ -268,6 +274,16 @@ Modules: `monitor` (protocol, memory, CPU control), `machine` (MEGA65 helpers),
 (`mpsse`, `xilinx`), `transport`.
 
 ## Protocol notes
+
+Virtual F011 drive (`vf011`, Studio's Drives tab): the Hypervisor only takes a
+virtual drive on or off when it boots, so attaching and detaching both trap
+into the Hypervisor, set or clear the flags ($D659 bit 0, $D68B) and restart
+it at $8100, the way `m65 -d` does; clearing the flags on a running machine
+leaves the ROM hung on a drive that no longer answers. Sector requests arrive
+as `<track|$80><sector|$80><side|$80>` followed by `!` (read) or `\` (write)
+and can land inside any other command's reply, so while a drive is served the
+monitor pulls them out of the input as it arrives (`Monitor::capture_vf011`);
+the ROM's boot-time directory read used to lose one that way and hang.
 
 Addresses prefixed `777` read memory as the CPU currently sees it, banking
 included. A program that remaps memory during its loop (MAP, `$01`, VIC banks)
