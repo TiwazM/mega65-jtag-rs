@@ -97,9 +97,11 @@ pub enum SdOp {
     /// Delete a file, or a directory with everything in it.
     Delete { path: String },
     Mkdir { path: String },
-    /// Ask the Hypervisor to mount a D81 from the card's root directory.
+    /// Put a disk image (D81/D64/D71/D65) from the card's root directory on
+    /// drive 8 by typing BASIC 65's MOUNT command at the READY prompt (after
+    /// stopping the SD helper and resetting if the MEGA65 is not there).
     Mount { name: String },
-    /// Stop the helper program and return the MEGA65 to BASIC.
+    /// Stop the helper program and reset the MEGA65 to the BASIC 65 prompt.
     Quit,
 }
 
@@ -135,7 +137,7 @@ pub enum Event {
     /// A directory of the SD card, with (free, total, bytes per cluster) if
     /// known, and the first sector of each disk image in it (name, sector), so
     /// the Drives tab can name what the Hypervisor has mounted.
-    SdListing { path: String, entries: Vec<DirEntry>, free: Option<(u64, u64, u64)>, images: Vec<(String, u32)> },
+    SdListing { path: String, entries: Vec<DirEntry>, free: Option<(u64, u64, u64)>, images: Vec<(String, u32)>, mounted: [u32; 2] },
     /// Transfer progress (done, total bytes), or None when finished.
     SdProgress(Option<(u64, u64)>),
     /// An SD operation finished: a one-line summary, or why it failed.
@@ -655,7 +657,9 @@ impl Worker {
                 match r {
                     Ok(res) => {
                         if let Some((path, entries, free, images)) = res.listing {
-                            self.emit(Event::SdListing { path, entries, free, images });
+                            // Which images the Hypervisor has on drives 8 and 9, by first sector.
+                            let mounted = self.mach().and_then(|m| mounted_images(&mut m.mon)).unwrap_or([0, 0]);
+                            self.emit(Event::SdListing { path, entries, free, images, mounted });
                         }
                         if !res.message.is_empty() {
                             self.log(format!("SD: {}", res.message));
@@ -738,12 +742,12 @@ impl Worker {
             ctx.request_repaint();
         };
         let m = self.mach()?;
+        if let SdOp::Mount { name } = op {
+            return mount_image(m, name);
+        }
         if direct {
             if matches!(op, SdOp::Quit) {
                 return Ok(SdResult { message: String::new(), listing: None });
-            }
-            if matches!(op, SdOp::Mount { .. }) {
-                return Err(mega65::Error::Other("mounting a disk image needs the fast (helper) mode".into()));
             }
             let dev = DirectSd::new(&mut m.mon);
             let mut fs = Fat32::open(dev)?;
@@ -759,12 +763,12 @@ impl Worker {
         })?;
         match op {
             SdOp::Quit => {
+                // The helper's own exit does not reliably get back to BASIC
+                // (the machine was found hung after it), so reset as well;
+                // a mounted image survives the reset.
                 dev.quit()?;
-                return Ok(SdResult { message: "SD helper stopped; the MEGA65 is back in BASIC".into(), listing: None });
-            }
-            SdOp::Mount { name } => {
-                dev.mount_d81(name)?;
-                return Ok(SdResult { message: format!("asked the Hypervisor to mount {name}"), listing: None });
+                m.reset_to_prompt()?;
+                return Ok(SdResult { message: "SD helper stopped; the MEGA65 restarted at the BASIC 65 prompt".into(), listing: None });
             }
             _ => {}
         }
@@ -980,7 +984,7 @@ fn sd_op<D: BlockDevice>(fs: &mut Fat32<D>, op: &SdOp, progress: &mut impl FnMut
         let free = fs.df(false).ok();
         let images = entries
             .iter()
-            .filter(|e| !e.is_dir() && e.cluster >= 2 && e.name.to_ascii_lowercase().ends_with(".d81"))
+            .filter(|e| !e.is_dir() && e.cluster >= 2 && is_disk_image(&e.name))
             .map(|e| (e.name.clone(), fs.cluster_sector(e.cluster)))
             .collect();
         Ok((path.to_string(), entries, free, images))
@@ -1021,6 +1025,54 @@ fn sd_op<D: BlockDevice>(fs: &mut Fat32<D>, op: &SdOp, progress: &mut impl FnMut
             Ok(SdResult { message: format!("created {path}"), listing: Some(listing(fs, &dir)?) })
         }
         SdOp::Mount { .. } | SdOp::Quit => unreachable!("handled before the filesystem is opened"),
+    }
+}
+
+/// Disk image types the Hypervisor's MOUNT accepts (ROM 920377 or later).
+pub fn is_disk_image(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.ends_with(".d81") || n.ends_with(".d64") || n.ends_with(".d71") || n.ends_with(".d65")
+}
+
+/// First sectors of the images on drives 8 and 9 ($D68C-$D693; 0 or
+/// $FFFFFFFF when nothing is mounted).
+fn mounted_images(mon: &mut Monitor) -> mega65::Result<[u32; 2]> {
+    let r = mon.read_memory(0xffd368c, 8)?;
+    let at = |o: usize| u32::from_le_bytes([r[o], r[o + 1], r[o + 2], r[o + 3]]);
+    Ok([at(0), at(4)])
+}
+
+/// Mount a root-directory image the way a user would: stop the SD helper if
+/// it is running, get the MEGA65 to the BASIC 65 prompt, type MOUNT, and
+/// check that the F011 image register now holds the file's first sector.
+/// The file is looked up through the direct SD path (a few sectors, with the
+/// CPU paused for a moment) so the check does not need the helper.
+fn mount_image(m: &mut Machine, name: &str) -> mega65::Result<SdResult> {
+    if !is_disk_image(name) {
+        return Err(mega65::Error::Other(format!("{name}: only .d81, .d64, .d71 and .d65 images can be mounted")));
+    }
+    let helper_was_up = HelperSd::quit_if_resident(&mut m.mon)?;
+    if helper_was_up {
+        // The helper ran in C64 mode; MOUNT needs BASIC 65, so reset.
+        m.reset()?;
+    }
+    let want = {
+        let mut fs = Fat32::open(DirectSd::new(&mut m.mon))?;
+        let e = fs.lookup(&format!("/{name}"))?.ok_or_else(|| mega65::Error::Other(format!("{name}: not found in the root folder")))?;
+        let want = fs.cluster_sector(e.cluster);
+        fs.close()?;
+        want
+    };
+    let before = mounted_images(&mut m.mon)?[0];
+    let after = m.mount_image(name)?;
+    if after == want {
+        Ok(SdResult { message: format!("{name} is now drive 8; the MEGA65 is at the BASIC 65 prompt"), listing: None })
+    } else if after == before {
+        Err(mega65::Error::Other(format!(
+            "MOUNT did not take {name} (drive 8 is unchanged); look at the MEGA65's screen for the DOS error"
+        )))
+    } else {
+        Err(mega65::Error::Other(format!("drive 8 changed to sector {after} but {name} starts at {want}; check the Drives tab")))
     }
 }
 

@@ -10,7 +10,7 @@ use egui::{Color32, RichText, TextureHandle, TextureOptions};
 use mega65::monitor::Registers;
 use mega65::{parse_hex, transport};
 
-use crate::backend::{Backend, Cmd, Event, SdOp};
+use crate::backend::{is_disk_image, Backend, Cmd, Event, SdOp};
 
 const MEM_VIEW: usize = 0;
 const MEM_VIEW_2: usize = 1;
@@ -180,6 +180,8 @@ struct SdState {
     free: Option<(u64, u64, u64)>,
     /// Disk images in the card's root and their first sectors, for naming mounts.
     images: Vec<(String, u32)>,
+    /// First sectors of the images on drives 8 and 9 when last listed.
+    mounted: [u32; 2],
     /// An operation is running on the worker.
     busy: bool,
     progress: Option<(u64, u64)>,
@@ -505,10 +507,11 @@ impl StudioApp {
                     self.stopped = true;
                     self.s.tab = Tab::Disassembly;
                 }
-                Event::SdListing { path, entries, free, images } => {
+                Event::SdListing { path, entries, free, images, mounted } => {
                     if path.trim_matches('/').is_empty() {
                         self.sd.images = images;
                     }
+                    self.sd.mounted = mounted;
                     self.s.sd_path = path.clone();
                     self.sd.listed = Some(path);
                     self.sd.entries = entries;
@@ -1701,7 +1704,8 @@ impl StudioApp {
         self.sd.result = None;
         self.sd.confirm_delete = None;
         if !self.s.sd_direct {
-            self.sd.helper_up = !matches!(op, SdOp::Quit);
+            // Mount stops the helper to get back to BASIC 65.
+            self.sd.helper_up = !matches!(op, SdOp::Quit | SdOp::Mount { .. });
         }
         self.backend.send(Cmd::Sd { op, direct: self.s.sd_direct, force: self.s.sd_force });
     }
@@ -1714,7 +1718,7 @@ impl StudioApp {
     }
 
     fn sd_tab(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("Copy files between this computer and the SD card in the MEGA65. Uploads go into one unbroken run of clusters when the card has room, which disk images need before the MEGA65 can mount them.").weak().small());
+        ui.label(RichText::new("Copy files between this computer and the SD card in the MEGA65. Uploads go into one unbroken run of clusters when the card has room, which disk images need before the MEGA65 can mount them. A disk image (.d81, .d64, .d71, .d65) in the root folder can be put on drive 8 with Mount on MEGA65: Studio brings the MEGA65 to the BASIC 65 prompt (stopping the helper, and resetting if a program was running) and types the MOUNT command. Images in other folders have to be moved to the root first.").weak().small());
         ui.horizontal_wrapped(|ui| {
             ui.label("Transfer:");
             ui.radio_value(&mut self.s.sd_direct, false, "fast (helper program)").on_hover_text("runs mega65-tools' remotesd helper on the MEGA65; about 160 KB/s");
@@ -1732,7 +1736,7 @@ impl StudioApp {
             RichText::new(if self.s.sd_direct {
                 "Gentle mode pauses the MEGA65 while it reads or writes the card and resumes it afterwards. A game with music will stutter."
             } else {
-                "Fast mode switches the MEGA65 to C64 mode and loads a small helper program, replacing whatever was in memory. It stays there between transfers; use Leave SD mode to get back to BASIC."
+                "Fast mode switches the MEGA65 to C64 mode and loads a small helper program, replacing whatever was in memory. It stays there between transfers; Leave SD mode stops it and resets the MEGA65 to the BASIC 65 prompt."
             })
             .weak()
             .small(),
@@ -1771,7 +1775,7 @@ impl StudioApp {
             }
             if self.sd.helper_up && !self.s.sd_direct {
                 ui.separator();
-                if ui.add_enabled(en, egui::Button::new("Leave SD mode")).on_hover_text("stop the helper program and return the MEGA65 to BASIC").clicked() {
+                if ui.add_enabled(en, egui::Button::new("Leave SD mode")).on_hover_text("stop the helper program and reset the MEGA65 to the BASIC 65 prompt (a mounted disk image stays mounted)").clicked() {
                     self.sd_send(SdOp::Quit);
                 }
             }
@@ -1842,13 +1846,18 @@ impl StudioApp {
                                     action = Some(SdOp::Get { remote: path.clone(), local });
                                 }
                             }
-                            let is_d81 = e.name.to_ascii_lowercase().ends_with(".d81");
-                            if is_d81
-                                && listed.trim_matches('/').is_empty()
-                                && !self.s.sd_direct
-                                && ui.add_enabled(en, egui::Button::new("Mount")).on_hover_text("ask the Hypervisor to mount this disk image as drive 8").clicked()
-                            {
-                                action = Some(SdOp::Mount { name: e.name.clone() });
+                            if is_disk_image(&e.name) {
+                                let sector = self.sd.images.iter().find(|(n, _)| *n == e.name).map(|(_, s)| *s);
+                                let in_root = listed.trim_matches('/').is_empty();
+                                if in_root && sector.is_some() && sector == Some(self.sd.mounted[0]) {
+                                    ui.label(RichText::new("▶ on drive 8").color(green).strong());
+                                } else if in_root && sector.is_some() && sector == Some(self.sd.mounted[1]) {
+                                    ui.label(RichText::new("▶ on drive 9").color(green).strong());
+                                } else if !in_root {
+                                    ui.label(RichText::new("move to the root folder to mount").weak().small());
+                                } else if ui.add_enabled(en, egui::Button::new(RichText::new("Mount on MEGA65").strong())).on_hover_text("type MOUNT for this image at the BASIC 65 prompt, replacing what is on drive 8; a running program is stopped by the reset this needs").clicked() {
+                                    action = Some(SdOp::Mount { name: e.name.clone() });
+                                }
                             }
                         }
                         if self.sd.confirm_delete.as_deref() == Some(path.as_str()) {

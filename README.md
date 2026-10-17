@@ -200,8 +200,11 @@ builds the same on macOS, Windows and Linux):
   re-read when it changes on disk, so edit on the PC and press Send again; Save
   PRG… writes the tokenized program locally), an SD card tab (browse the card's
   folders with Open/Up buttons, Upload file… or drop a file on the window,
-  Download, Delete with a confirming second click, Create folder, and Mount for
-  a `.d81` in the root; uploads use the same contiguous-when-possible layout as
+  Download, Delete with a confirming second click, Create folder, and Mount on
+  MEGA65 for a `.d81`/`.d64`/`.d71`/`.d65` in the root folder, which stops the
+  helper, resets to the BASIC 65 prompt if needed and types MOUNT, then checks
+  the F011 image register holds the file's first sector; the listing marks the
+  image on drive 8; uploads use the same contiguous-when-possible layout as
   `m65rs sd put`, with the choice shown as three radio buttons, and report
   whether the file landed in one piece; fast mode runs the mega65-tools helper
   on the MEGA65 and Leave SD mode returns it to BASIC, gentle mode drives the SD
@@ -220,6 +223,8 @@ path without a window: list the root, and with a file, upload it to a
 only `direct` works, because the helper's serial replies go to Xemu's log, not
 to the monitor socket. `--selftest-vf011 DEVICE FILE.D81` serves the image and
 types DIR at the READY prompt, reporting how many sectors were asked for.
+`--selftest-mount DEVICE NAME` mounts a root-folder image and shows what
+drives 8 and 9 hold before and after.
 
 All hardware traffic runs on one worker thread, so the UI never blocks and
 panels can't interleave commands. Settings persist between runs.

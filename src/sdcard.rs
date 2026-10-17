@@ -153,15 +153,30 @@ pub struct HelperSd<'a> {
 }
 
 impl<'a> HelperSd<'a> {
-    /// Upload and start the helper unless it is already running.
-    pub fn start(mach: &'a mut Machine, force: bool) -> Result<Self> {
-        let mon = &mut mach.mon;
+    /// Is the helper running on the MEGA65? Job 0x13 answers with its version string.
+    pub fn is_resident(mon: &mut Monitor) -> Result<bool> {
         mon.sync()?;
-        // Is a helper already resident? Job 0x13 answers with its version string.
         mon.purge()?;
         mon.write_raw(b"sc001 13\rsc000 1\r")?;
         let reply = mon.read_quiet(Duration::from_millis(200), Duration::from_millis(1500))?;
-        if find(&reply, b"MEGA65FT1.0") {
+        Ok(find(&reply, b"MEGA65FT1.0"))
+    }
+
+    /// If the helper is running, tell it to exit back to BASIC (job 0xFF).
+    /// Returns whether it was.
+    pub fn quit_if_resident(mon: &mut Monitor) -> Result<bool> {
+        if !Self::is_resident(mon)? {
+            return Ok(false);
+        }
+        mon.write_raw(b"sc001 ff\rsc000 1\r")?;
+        std::thread::sleep(Duration::from_millis(300));
+        mon.purge()?;
+        Ok(true)
+    }
+
+    /// Upload and start the helper unless it is already running.
+    pub fn start(mach: &'a mut Machine, force: bool) -> Result<Self> {
+        if Self::is_resident(&mut mach.mon)? {
             return Ok(Self::wrap(&mut mach.mon));
         }
         mach.detect_mode(Duration::from_secs(10))?;

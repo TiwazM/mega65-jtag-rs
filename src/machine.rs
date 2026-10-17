@@ -476,6 +476,64 @@ impl Machine {
         Ok(HyppoStatus { text: t })
     }
 
+    /// Mount a disk image from the SD card's root folder as drive 8 by typing
+    /// BASIC 65's `MOUNT` command, so the machine stays in its native mode and
+    /// ends at the READY prompt with the image attached. The MEGA65 is reset
+    /// first unless it is already sitting at the BASIC 65 prompt, so a running
+    /// program is lost. Returns the F011 image register ($D68C) afterwards,
+    /// which holds the image's first sector when the mount took.
+    pub fn mount_image(&mut self, name: &str) -> Result<u32> {
+        if !self.at_basic65_prompt()? {
+            self.reset_to_prompt()?;
+        }
+        self.mode = Mode::C65;
+        self.stuff_keybuffer(&format!("mount \"{}\"\r", name.to_ascii_lowercase()))?;
+        // Give DOS a moment to open the file and tell the Hypervisor.
+        let start = std::time::Instant::now();
+        loop {
+            std::thread::sleep(Duration::from_millis(250));
+            if self.at_basic65_prompt()? || start.elapsed() > Duration::from_secs(5) {
+                break;
+            }
+        }
+        let r = self.mon.read_memory(0xffd368c, 4)?;
+        Ok(u32::from_le_bytes([r[0], r[1], r[2], r[3]]))
+    }
+
+    /// Reset and wait until BASIC 65 is at its READY prompt. A mounted disk
+    /// image survives this: the Hypervisor keeps it across a reset.
+    pub fn reset_to_prompt(&mut self) -> Result<()> {
+        self.reset()?;
+        let start = std::time::Instant::now();
+        while !self.at_basic65_prompt()? {
+            if start.elapsed() > Duration::from_secs(15) {
+                return Err(Error::Other("the MEGA65 did not come back to the BASIC 65 prompt after a reset".into()));
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        self.mode = Mode::C65;
+        Ok(())
+    }
+
+    /// Is BASIC 65 waiting at READY? ($3A, the high byte of the current line
+    /// number, is $FF in direct mode.)
+    pub fn at_basic65_prompt(&mut self) -> Result<bool> {
+        if self.in_hypervisor()? {
+            return Ok(false);
+        }
+        if self.mon.peek(VIC_BASE + 0x30)? & 1 != 0 {
+            return Ok(false);
+        }
+        let d054 = self.mon.peek(VIC_BASE + 0x54)?;
+        if d054 & 7 != 0 {
+            return Ok(false);
+        }
+        if self.mon.peek(VIC_BASE + 0x61)? != 0x08 {
+            return Ok(false);
+        }
+        Ok(self.mon.peek(0x3a)? == 0xff)
+    }
+
     // ------------------------------------------------------------ control
 
     /// Reset via the monitor and wait for the ROM to come back up.
