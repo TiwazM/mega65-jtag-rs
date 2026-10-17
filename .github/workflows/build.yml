@@ -61,7 +61,7 @@ jobs:
           cp -R "target/macos/MEGA65 Studio.app" target/release/m65rs README.md LICENSE CREDITS.md dist/pkg/
           ln -s /Applications dist/pkg/Applications # drag the app onto this to install
           hdiutil create -volname "MEGA65 Studio" -srcfolder dist/pkg -format UDZO -ov \
-            "dist/mega65-tools-${{ github.ref_name }}-${{ matrix.name }}.dmg"
+            "dist/mega65-studio-${{ github.ref_name }}-${{ matrix.name }}.dmg"
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
@@ -69,14 +69,14 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force dist/pkg | Out-Null
           Copy-Item target/release/m65rs.exe, target/release/m65-studio.exe, README.md, LICENSE, CREDITS.md dist/pkg/
-          Compress-Archive -Path dist/pkg/* -DestinationPath "dist/mega65-tools-${{ github.ref_name }}-${{ matrix.name }}.zip"
+          Compress-Archive -Path dist/pkg/* -DestinationPath "dist/mega65-studio-${{ github.ref_name }}-${{ matrix.name }}.zip"
 
       - name: Package (Linux)
         if: runner.os == 'Linux'
         run: |
           mkdir -p dist/pkg
           cp target/release/m65rs target/release/m65-studio README.md LICENSE CREDITS.md dist/pkg/
-          tar -czf "dist/mega65-tools-${{ github.ref_name }}-${{ matrix.name }}.tar.gz" -C dist/pkg .
+          tar -czf "dist/mega65-studio-${{ github.ref_name }}-${{ matrix.name }}.tar.gz" -C dist/pkg .
           curl -fsSL -o appimagetool \
             https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
           chmod +x appimagetool
