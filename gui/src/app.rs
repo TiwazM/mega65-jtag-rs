@@ -118,6 +118,7 @@ pub struct StudioApp {
     s: Settings,
     connected: bool,
     xemu: bool,
+    xemu_ext: bool,
     busy: bool,
     status: String,
     regs: Option<Registers>,
@@ -189,6 +190,7 @@ impl StudioApp {
             s,
             connected: false,
             xemu: false,
+            xemu_ext: false,
             busy: false,
             status: "not connected".into(),
             regs: None,
@@ -277,15 +279,18 @@ impl StudioApp {
     fn drain_events(&mut self, ctx: &egui::Context) {
         while let Ok(ev) = self.backend.rx.try_recv() {
             match ev {
-                Event::Connected { device, xemu, versions } => {
+                Event::Connected { device, xemu, xemu_ext, versions } => {
                     self.connected = true;
                     self.xemu = xemu;
+                    self.xemu_ext = xemu_ext;
                     self.status = match versions {
                         Some(v) => format!("{device}: {} / {} / {}", v.model, v.core, v.rom),
                         None => device,
                     };
-                    if xemu {
-                        self.status.push_str("  [Xemu: CPU can't be resumed after a halt]");
+                    if xemu_ext {
+                        self.status.push_str("  [Xemu ai-agent build: frame stepping available]");
+                    } else if xemu {
+                        self.status.push_str("  [stock Xemu: CPU can't be resumed after a halt]");
                     }
                     self.push_log(format!("connected: {}", self.status));
                     self.last_error = None;
@@ -438,17 +443,26 @@ impl StudioApp {
             }
             ui.separator();
             let en = self.connected && !self.busy;
-            let can_resume = en && !(self.xemu && self.stopped);
+            let stock_xemu = self.xemu && !self.xemu_ext;
+            let can_resume = en && !(stock_xemu && self.stopped);
             if ui.add_enabled(en, egui::Button::new("⏸ Stop")).on_hover_text("halt the CPU (t1)").clicked() {
                 self.backend.send(Cmd::Stop);
             }
             if ui.add_enabled(can_resume, egui::Button::new("▶ Go")).on_hover_text("resume (t0)").clicked() {
                 self.backend.send(Cmd::Go);
             }
-            if ui.add_enabled(en && !self.xemu, egui::Button::new("⏭ Step")).clicked() {
+            if ui.add_enabled(en && !stock_xemu, egui::Button::new("⏭ Step")).clicked() {
                 self.backend.send(Cmd::Step(self.step_count));
             }
             ui.add(egui::DragValue::new(&mut self.step_count).range(1..=1000)).on_hover_text("instructions per step");
+            if self.xemu_ext {
+                if ui.add_enabled(en, egui::Button::new("⏵ Frame")).on_hover_text("run exactly one video frame, then pause (Xemu)").clicked() {
+                    self.backend.send(Cmd::Frames(1));
+                }
+                if ui.add_enabled(en, egui::Button::new("10 frames")).on_hover_text("run ten video frames, then pause (Xemu)").clicked() {
+                    self.backend.send(Cmd::Frames(10));
+                }
+            }
             if ui.add_enabled(en, egui::Button::new("Refresh")).clicked() {
                 self.send_views();
                 self.backend.send(Cmd::Refresh);
@@ -735,7 +749,7 @@ impl StudioApp {
             if ui.checkbox(&mut self.s.live_screen, "Auto").on_hover_text("capture on every live poll (slow: ~1 s each)").changed() {
                 self.send_live();
             }
-            ui.checkbox(&mut self.s.pause_for_screen, "Pause CPU while capturing").on_hover_text("gives a consistent frame; not available on Xemu");
+            ui.checkbox(&mut self.s.pause_for_screen, "Pause CPU while capturing").on_hover_text("gives a consistent frame; ignored on stock Xemu, not needed on the ai-agent build (it delivers whole frames)");
             if ui.add_enabled(en && self.screen_tex.is_some(), egui::Button::new("Save PNG…")).clicked() {
                 if let Some(p) = rfd::FileDialog::new().set_file_name("mega65-screen.png").add_filter("PNG", &["png"]).save_file() {
                     self.backend.send(Cmd::SavePng { path: p, pause: self.s.pause_for_screen });
@@ -747,8 +761,9 @@ impl StudioApp {
         });
         if let Some(t) = &self.screen_tex {
             let avail = ui.available_size();
-            let scale = (avail.x / 720.0).min(avail.y / t.size()[1] as f32).max(0.1);
-            ui.image((t.id(), egui::vec2(720.0 * scale, t.size()[1] as f32 * scale)));
+            let (w, h) = (t.size()[0] as f32, t.size()[1] as f32);
+            let scale = (avail.x / w).min(avail.y / h).max(0.1);
+            ui.image((t.id(), egui::vec2(w * scale, h * scale)));
         } else {
             ui.label(RichText::new("no capture yet").weak());
         }

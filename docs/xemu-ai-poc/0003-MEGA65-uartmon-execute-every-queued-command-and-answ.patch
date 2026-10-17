@@ -1,7 +1,7 @@
 From a3b82be333d56a96f1581debb330b78ba56f140a Mon Sep 17 00:00:00 2001
 From: Tiwaz <82827604+TiwazM@users.noreply.github.com>
 Date: Sat, 17 Oct 2026 15:26:14 +0200
-Subject: [PATCH 3/3] MEGA65: uartmon: execute every queued command and answer
+Subject: [PATCH 3/4] MEGA65: uartmon: execute every queued command and answer
  in the same update
 
 The monitor used to read one command per frame and send its answer on

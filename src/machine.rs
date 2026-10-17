@@ -255,6 +255,9 @@ impl Machine {
 
     /// Press one key through the virtual keyboard (works anywhere, including in games).
     pub fn type_key(&mut self, key: u8) -> Result<()> {
+        // Xemu turns a shifted letter into a graphics character, so letters go
+        // unshifted there (BASIC accepts either case).
+        let key = if self.mon.xemu && key.is_ascii_uppercase() { key.to_ascii_lowercase() } else { key };
         let Some((code, shift)) = matrix_code(key) else { return Ok(()) };
         let gap = Duration::from_millis(20);
         if shift {

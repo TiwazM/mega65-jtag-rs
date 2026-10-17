@@ -1,7 +1,7 @@
 From be3d7fa462829af675b7b1bc56a429cb055f24cc Mon Sep 17 00:00:00 2001
 From: Tiwaz <82827604+TiwazM@users.noreply.github.com>
 Date: Sat, 17 Oct 2026 15:26:14 +0200
-Subject: [PATCH 2/3] MEGA65: uartmon commands for automated testing: ~frames
+Subject: [PATCH 2/4] MEGA65: uartmon commands for automated testing: ~frames
  ~joy ~shot ~sleepless ~mem
 
 Lets a test harness or an AI agent drive the emulator through the

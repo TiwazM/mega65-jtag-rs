@@ -64,6 +64,10 @@ pub struct Monitor {
     pub cpu_stopped: bool,
     /// Talking to Xemu's emulated monitor (one command at a time, no `#`).
     pub xemu: bool,
+    /// Xemu built with the `ai-agent` monitor extensions (`~frames`, `~joy`,
+    /// `~shot`, `~mem`, `~sleepless`; see docs/xemu-ai-poc). Those builds also
+    /// resume and single-step safely.
+    pub xemu_ext: bool,
     /// Pace single bytes (old bitstreams without an RX FIFO, serial only).
     pace_writes: bool,
     /// Upload with `l` without halting the CPU (the SD helper tolerates it and
@@ -79,7 +83,7 @@ pub struct Monitor {
 
 impl Monitor {
     pub fn new(t: Box<dyn Transport>) -> Self {
-        Self { t, rx: Vec::new(), rx_buffered: true, cpu_stopped: false, xemu: false, pace_writes: false, debug: false, events: Vec::new(), stray: Vec::new(), load_without_halt: false }
+        Self { t, rx: Vec::new(), rx_buffered: true, cpu_stopped: false, xemu: false, xemu_ext: false, pace_writes: false, debug: false, events: Vec::new(), stray: Vec::new(), load_without_halt: false }
     }
 
     /// Open the transport and synchronise with the monitor.
@@ -211,6 +215,11 @@ impl Monitor {
                         // command per read, so we can't pipeline.
                         self.xemu = true;
                         self.rx_buffered = false;
+                        // The ai-agent branch answers `~sleepless 0` with "SLEEPLESS 0";
+                        // stock Xemu calls it an unknown special command.
+                        if let Ok(out) = self.command("~sleepless 0") {
+                            self.xemu_ext = out.contains("SLEEPLESS");
+                        }
                     }
                     return Ok(());
                 }
@@ -284,11 +293,12 @@ impl Monitor {
 
     /// Let the CPU run (`t0`). Also used to resume after a breakpoint.
     pub fn start_cpu(&mut self) -> Result<()> {
-        if self.xemu && self.cpu_stopped {
-            // Xemu (at least the 2026 "next" builds) crashes with SIGBUS when it
-            // leaves trace mode, so refuse rather than kill the emulator.
+        if self.xemu && !self.xemu_ext && self.cpu_stopped {
+            // Stock Xemu (the 2026 "next" builds, windowed) crashes with SIGBUS when
+            // it leaves trace mode, so refuse rather than kill the emulator. The
+            // ai-agent branch has the fix.
             return Err(Error::Other(
-                "this Xemu build crashes when the CPU is resumed after a halt or breakpoint; restart Xemu instead".into(),
+                "this Xemu build crashes when the CPU is resumed after a halt or breakpoint; restart Xemu instead (or use the ai-agent build, see docs/xemu-ai-poc)".into(),
             ));
         }
         self.command("t0")?;
@@ -297,14 +307,15 @@ impl Monitor {
     }
 
     /// Run `f` with the CPU halted, restoring the previous run state afterwards.
-    /// On Xemu (which can't resume) the CPU is left running.
+    /// On stock Xemu (which can't resume) the CPU is left running.
     pub fn with_cpu_paused<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        let cant_pause = self.xemu && !self.xemu_ext;
         let was_stopped = self.cpu_stopped;
-        if !was_stopped && !self.xemu {
+        if !was_stopped && !cant_pause {
             self.stop_cpu()?;
         }
         let r = f(self);
-        if !was_stopped && !self.xemu {
+        if !was_stopped && !cant_pause {
             self.start_cpu()?;
         }
         r
@@ -317,17 +328,86 @@ impl Monitor {
 
     /// Execute one instruction (CPU must be stopped) and return the register dump.
     pub fn step(&mut self) -> Result<Registers> {
-        if self.xemu {
+        if self.xemu && !self.xemu_ext {
             return Err(Error::Other("single-stepping crashes this Xemu build's monitor".into()));
         }
         if !self.cpu_stopped {
             self.stop_cpu()?;
+        }
+        if self.xemu {
+            // Xemu answers a step on its next frame (up to ~20 ms), too slow for the
+            // quiet-time read below; wait for its prompt instead.
+            let text = self.command_timeout("", Duration::from_secs(2))?;
+            return Registers::parse(&text).ok_or_else(|| Error::Protocol(format!("could not parse step output: {text:?}")));
         }
         self.purge()?;
         self.write_raw(b"\r")?;
         let out = self.read_quiet(Duration::from_millis(15), Duration::from_millis(500))?;
         let text = String::from_utf8_lossy(&out).replace('\r', "");
         Registers::parse(&text).ok_or_else(|| Error::Protocol(format!("could not parse step output: {text:?}")))
+    }
+
+    // ------------------------------------------------ Xemu monitor extensions
+
+    fn need_xemu_ext(&self) -> Result<()> {
+        if self.xemu_ext {
+            Ok(())
+        } else {
+            Err(Error::Other("needs Xemu with the ai-agent monitor extensions (see docs/xemu-ai-poc)".into()))
+        }
+    }
+
+    /// Run exactly `frames` video frames with the current inputs, then pause the
+    /// CPU and return the registers. Works whether or not the CPU was halted.
+    pub fn xemu_frames(&mut self, frames: u32) -> Result<Registers> {
+        self.need_xemu_ext()?;
+        let frames = frames.max(1);
+        let timeout = Duration::from_millis(3000 + 25 * frames as u64);
+        let text = self.command_timeout(&format!("~frames {frames:x}"), timeout)?;
+        self.cpu_stopped = true;
+        Registers::parse(&text).ok_or_else(|| Error::Protocol(format!("could not parse ~frames output: {text:?}")))
+    }
+
+    /// Hold joystick inputs on port 1 or 2 until the next call: bit 0 up, 1 down,
+    /// 2 left, 3 right, 4 fire; 0 releases everything.
+    pub fn xemu_joystick(&mut self, port: u8, bits: u8) -> Result<()> {
+        self.need_xemu_ext()?;
+        if !(1..=2).contains(&port) {
+            return Err(Error::Other("joystick port must be 1 or 2".into()));
+        }
+        self.command(&format!("~joy{port} {:x}", bits & 0x1f))?;
+        Ok(())
+    }
+
+    /// Run as fast as the host allows (`fast`) or at real-time speed.
+    pub fn xemu_sleepless(&mut self, fast: bool) -> Result<()> {
+        self.need_xemu_ext()?;
+        self.command(&format!("~sleepless {}", fast as u8))?;
+        Ok(())
+    }
+
+    /// Have Xemu write its next completed frame as a PNG (its own renderer's exact
+    /// pixels) to `path`, and return the absolute path. With the CPU halted, one
+    /// frame is run to complete the picture (the CPU stays halted afterwards).
+    pub fn xemu_screenshot(&mut self, path: &std::path::Path) -> Result<std::path::PathBuf> {
+        self.need_xemu_ext()?;
+        let abs = if path.is_absolute() { path.to_path_buf() } else { std::env::current_dir()?.join(path) };
+        let _ = std::fs::remove_file(&abs);
+        self.command(&format!("~shot {}", abs.display()))?;
+        if self.cpu_stopped {
+            self.xemu_frames(1)?;
+        } else {
+            let start = Instant::now();
+            while !abs.exists() {
+                if start.elapsed() > Duration::from_secs(2) {
+                    return Err(Error::Timeout("Xemu did not write the screenshot".into()));
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            // The file appears when Xemu opens it; give the write a moment to finish.
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Ok(abs)
     }
 
     /// Send a command and return its output as soon as the prompt arrives,
@@ -460,6 +540,27 @@ impl Monitor {
     pub fn read_memory(&mut self, addr: u32, len: usize) -> Result<Vec<u8>> {
         let mut out = Vec::with_capacity(len);
         let mut cur = addr;
+        if self.xemu_ext && len > 16 {
+            // One `~mem` answer per 128 KB instead of one `M` round trip per 256 bytes.
+            let mut left = len;
+            while left > 0 {
+                let n = left.min(0x20000);
+                let cmd = format!("~mem {cur:x} {n:x}");
+                let text = self.command_timeout(&cmd, Duration::from_secs(10))?;
+                let line = text
+                    .lines()
+                    .map(str::trim)
+                    .find(|l| l.len() == n * 2)
+                    .ok_or_else(|| Error::Protocol(format!("no memory data for {cmd}: {text:?}")))?;
+                for i in 0..n {
+                    let b = u8::from_str_radix(&line[i * 2..i * 2 + 2], 16).map_err(|_| Error::Protocol(format!("bad hex in {cmd} answer")))?;
+                    out.push(b);
+                }
+                cur = cur.wrapping_add(n as u32);
+                left -= n;
+            }
+            return Ok(out);
+        }
         let end = addr as u64 + len as u64;
         while (cur as u64) < end {
             let remaining = (end - cur as u64) as usize;

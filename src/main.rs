@@ -98,6 +98,23 @@ enum Cmd {
         #[arg(long)]
         no_irq: bool,
     },
+    /// Xemu (ai-agent build) only: run exactly N video frames with the current inputs, pause, and print the registers.
+    Frames {
+        #[arg(default_value_t = 1)]
+        count: u32,
+        /// No real-time pacing while the frames run (as fast as the host can).
+        #[arg(long)]
+        fast: bool,
+    },
+    /// Xemu (ai-agent build) only: hold joystick inputs until the next `joy`, e.g. `joy 2 left fire`; `joy 2 none` releases.
+    Joy {
+        /// Joystick port, 1 or 2.
+        port: u8,
+        /// up, down, left, right, fire, none
+        inputs: Vec<String>,
+    },
+    /// Xemu (ai-agent build) only: run at full host speed (`fast`) or in real time (`normal`).
+    Speed { mode: String },
     /// Set a breakpoint and wait for it (or `clear`).
     Break {
         addr: String,
@@ -596,6 +613,36 @@ fn run(cmd: Cmd, mut mach: Machine, syms: &mega65::symbols::SymbolTable) -> anyh
                 println!("{}", r.raw.lines().last().unwrap_or(""));
             }
         }
+        Cmd::Frames { count, fast } => {
+            if fast {
+                mach.mon.xemu_sleepless(true)?;
+            }
+            let r = mach.mon.xemu_frames(count);
+            if fast {
+                mach.mon.xemu_sleepless(false)?;
+            }
+            println!("{}", r?.raw);
+        }
+        Cmd::Joy { port, inputs } => {
+            let mut bits = 0u8;
+            for i in &inputs {
+                bits |= match i.to_ascii_lowercase().as_str() {
+                    "up" | "u" => 1,
+                    "down" | "d" => 2,
+                    "left" | "l" => 4,
+                    "right" | "r" => 8,
+                    "fire" | "f" | "button" => 16,
+                    "none" | "release" => 0,
+                    other => bail!("unknown joystick input {other:?} (up, down, left, right, fire, none)"),
+                };
+            }
+            mach.mon.xemu_joystick(port, bits)?;
+        }
+        Cmd::Speed { mode } => match mode.as_str() {
+            "fast" => mach.mon.xemu_sleepless(true)?,
+            "normal" => mach.mon.xemu_sleepless(false)?,
+            _ => bail!("speed: fast or normal"),
+        },
         Cmd::Break { addr, no_wait, timeout } => {
             if addr == "clear" {
                 mach.mon.set_breakpoint(None)?;
@@ -786,9 +833,15 @@ fn run(cmd: Cmd, mut mach: Machine, syms: &mega65::symbols::SymbolTable) -> anyh
                 print!("{}", vs.to_ansi());
             }
             if let Some(p) = png {
-                let mut f = std::fs::File::create(&p)?;
-                vs.to_png(&mut mach.mon, &mut f)?;
-                println!("wrote {p} ({}x{}, {} mode)", 720, vs.height(), if vs.pal { "PAL" } else { "NTSC" });
+                if mach.mon.xemu_ext {
+                    // Xemu's own renderer: exact pixels, one frame of latency.
+                    let abs = mach.mon.xemu_screenshot(std::path::Path::new(&p))?;
+                    println!("wrote {} (Xemu's frame)", abs.display());
+                } else {
+                    let mut f = std::fs::File::create(&p)?;
+                    vs.to_png(&mut mach.mon, &mut f)?;
+                    println!("wrote {p} ({}x{}, {} mode)", 720, vs.height(), if vs.pal { "PAL" } else { "NTSC" });
+                }
             }
         }
         Cmd::Type { text, ret, buffer } => {

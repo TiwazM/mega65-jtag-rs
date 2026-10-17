@@ -23,6 +23,8 @@ pub enum Cmd {
     Go,
     GoTo(u16),
     Step(usize),
+    /// Xemu (ai-agent build): run exactly N video frames, then pause.
+    Frames(u32),
     SetBreak(Option<u16>),
     SetWatch(Option<u32>),
     SetIrqs(bool),
@@ -63,7 +65,7 @@ pub enum Cmd {
 
 #[derive(Debug)]
 pub enum Event {
-    Connected { device: String, xemu: bool, versions: Option<Versions> },
+    Connected { device: String, xemu: bool, xemu_ext: bool, versions: Option<Versions> },
     Disconnected,
     Registers { regs: Registers, stopped: bool },
     Memory { id: usize, addr: u32, data: Vec<u8> },
@@ -245,9 +247,10 @@ impl Worker {
                 let mut m = Machine::new(mon);
                 let versions = m.versions().ok();
                 let xemu = m.mon.xemu;
+                let xemu_ext = m.mon.xemu_ext;
                 self.mach = Some(m);
                 self.last_regs = None;
-                self.emit(Event::Connected { device, xemu, versions });
+                self.emit(Event::Connected { device, xemu, xemu_ext, versions });
                 self.refresh_all()?;
             }
             Cmd::Disconnect => {
@@ -277,6 +280,11 @@ impl Worker {
                         self.log(regs.raw.lines().last().unwrap_or("").to_string());
                     }
                 }
+                self.refresh_all()?;
+            }
+            Cmd::Frames(n) => {
+                let regs = self.mach()?.mon.xemu_frames(n)?;
+                self.log(format!("{n} frame{} run; {}", if n == 1 { "" } else { "s" }, regs.raw.lines().last().unwrap_or("")));
                 self.refresh_all()?;
             }
             Cmd::SetBreak(pc) => {
@@ -595,6 +603,22 @@ impl Worker {
 
     fn screenshot(&mut self, pause: bool, png: Option<PathBuf>) -> mega65::Result<()> {
         let m = self.mach()?;
+        if m.mon.xemu_ext {
+            // Xemu's own frame (exact pixels, ~100 ms); the text still comes from screen RAM.
+            let tmp = std::env::temp_dir().join(format!("m65-studio-screen-{}.png", std::process::id()));
+            let p = m.mon.xemu_screenshot(&tmp)?;
+            let (width, height, rgb) = decode_png_rgb(&p)?;
+            if let Some(dst) = &png {
+                std::fs::copy(&p, dst)?;
+            }
+            let _ = std::fs::remove_file(&p);
+            let text = VideoState::capture(&mut m.mon)?.to_text();
+            if let Some(dst) = png {
+                self.log(format!("saved Xemu's frame to {}", dst.display()));
+            }
+            self.emit(Event::Screen { width, height, rgb, text });
+            return Ok(());
+        }
         let vs = if pause { m.mon.with_cpu_paused(VideoState::capture)? } else { VideoState::capture(&mut m.mon)? };
         let rgb = vs.render(&mut m.mon)?;
         if let Some(p) = png {
@@ -609,4 +633,20 @@ impl Worker {
         self.emit(Event::Screen { width: 720, height: vs.height(), rgb, text: vs.to_text() });
         Ok(())
     }
+}
+
+/// Read a PNG file as packed 8-bit RGB.
+fn decode_png_rgb(path: &std::path::Path) -> mega65::Result<(usize, usize, Vec<u8>)> {
+    let other = |e: png::DecodingError| mega65::Error::Other(format!("{}: {e}", path.display()));
+    let decoder = png::Decoder::new(std::fs::File::open(path)?);
+    let mut reader = decoder.read_info().map_err(other)?;
+    let mut buf = vec![0; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).map_err(other)?;
+    buf.truncate(info.buffer_size());
+    let rgb = match info.color_type {
+        png::ColorType::Rgb => buf,
+        png::ColorType::Rgba => buf.chunks(4).flat_map(|p| p[..3].to_vec()).collect(),
+        other => return Err(mega65::Error::Other(format!("unexpected PNG colour type {other:?}"))),
+    };
+    Ok((info.width as usize, info.height as usize, rgb))
 }

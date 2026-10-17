@@ -1,0 +1,44 @@
+From 0d3574967841f912d9548169e75c5099a2f692f8 Mon Sep 17 00:00:00 2001
+From: Tiwaz <82827604+TiwazM@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 15:44:55 +0200
+Subject: [PATCH 4/4] MEGA65: uartmon: ignore SIGPIPE so a disconnecting client
+ cannot kill the emulator
+
+A monitor client that closes its socket while an answer is still pending
+(for example a command-line tool that stopped waiting) made the next
+send() raise SIGPIPE and terminate Xemu (exit status 141). Ignore the
+signal once the monitor socket is set up; send() then just fails and the
+connection is dropped as before.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ targets/mega65/uart_monitor.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/targets/mega65/uart_monitor.c b/targets/mega65/uart_monitor.c
+index 790391da..5c37664d 100644
+--- a/targets/mega65/uart_monitor.c
++++ b/targets/mega65/uart_monitor.c
+@@ -33,6 +33,7 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA */
+ #ifndef XEMU_ARCH_WIN
+ #include <unistd.h>
+ #include <sys/un.h>
++#include <signal.h>
+ #endif
+ 
+ #define UMON_WRITE_BUFFER_SIZE	0x40000
+@@ -587,6 +588,11 @@ int uartmon_init ( const char *fn )
+ 		xemusock_close(sock, NULL);
+ 		return 1;
+ 	}
++#ifndef XEMU_ARCH_WIN
++	// A client that disconnects while an answer is still pending (eg a CLI tool that gave up
++	// waiting) must not kill the emulator: writing to the closed socket would raise SIGPIPE.
++	signal(SIGPIPE, SIG_IGN);
++#endif
+ 	DEBUG("UARTMON: monitor is listening on socket %s" NL, fn);
+ 	sock_client = UNCONNECTED;	// no client connection yet
+ 	sock_server = sock;		// now set the server socket visible outside of this function too
+-- 
+2.47.0
+
