@@ -1,9 +1,11 @@
 # Builds and tests m65rs and MEGA65 Studio on macOS, Windows and Linux.
 #
 # - Every push to master (and every pull request): build + test on all three.
-#   The finished zips are kept for 30 days under "Artifacts" on the run's page.
+#   The finished downloads are kept for 30 days under "Artifacts" on the run's page.
 # - Pushing a tag that starts with "v" (e.g. v0.1.0): the same, and then a
-#   GitHub Release with that name is created with the three downloads attached.
+#   GitHub Release with that name is created with the downloads attached:
+#   macOS .dmg (Studio.app + m65rs), Windows .zip (m65-studio.exe + m65rs.exe),
+#   Linux .tar.gz (both binaries) and a Linux .AppImage (Studio, m65rs inside).
 name: Build
 
 on:
@@ -57,7 +59,9 @@ jobs:
           gui/macos/build-app.sh
           mkdir -p dist/pkg
           cp -R "target/macos/MEGA65 Studio.app" target/release/m65rs README.md dist/pkg/
-          ditto -c -k dist/pkg "dist/mega65-tools-${{ github.ref_name }}-${{ matrix.name }}.zip"
+          ln -s /Applications dist/pkg/Applications # drag the app onto this to install
+          hdiutil create -volname "MEGA65 Studio" -srcfolder dist/pkg -format UDZO -ov \
+            "dist/mega65-tools-${{ github.ref_name }}-${{ matrix.name }}.dmg"
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
@@ -73,11 +77,20 @@ jobs:
           mkdir -p dist/pkg
           cp target/release/m65rs target/release/m65-studio README.md dist/pkg/
           tar -czf "dist/mega65-tools-${{ github.ref_name }}-${{ matrix.name }}.tar.gz" -C dist/pkg .
+          curl -fsSL -o appimagetool \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+          APPIMAGETOOL="$PWD/appimagetool" gui/linux/build-appimage.sh \
+            "$PWD/dist/MEGA65_Studio-${{ github.ref_name }}-x86_64.AppImage"
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
-          path: dist/mega65-tools-*
+          path: |
+            dist/*.dmg
+            dist/*.zip
+            dist/*.tar.gz
+            dist/*.AppImage
           retention-days: 30
 
   release:
