@@ -11,6 +11,10 @@ fn main() -> eframe::Result {
         selftest_basic(args.get(2).cloned().unwrap_or_default(), args.get(3).cloned().unwrap_or_default());
         return Ok(());
     }
+    if args.get(1).map(|a| a == "--selftest-sd").unwrap_or(false) {
+        selftest_sd(args.get(2).cloned().unwrap_or_default(), args.get(3).cloned(), args.get(4).map(|a| a == "direct").unwrap_or(false));
+        return Ok(());
+    }
     if args.get(1).map(|a| a == "--selftest").unwrap_or(false) {
         selftest(args.get(2).cloned().unwrap_or_default());
         return Ok(());
@@ -112,4 +116,91 @@ fn selftest_basic(device: String, file: String) {
         }
     }
     println!("SELFTEST TIMED OUT");
+}
+
+/// `m65-studio --selftest-sd DEVICE [FILE] [direct]`: list the card's root
+/// through the worker as the SD tab does; with FILE, upload it to a
+/// `STUDIOTEST` folder, download it again and compare, then delete the folder.
+/// `direct` uses the slow register path (the helper's replies never reach
+/// Xemu's monitor socket, so that is the only way to test on Xemu).
+fn selftest_sd(device: String, file: Option<String>, direct: bool) {
+    use backend::{Backend, Cmd, Event, SdOp};
+    use std::time::{Duration, Instant};
+    let b = Backend::start(egui::Context::default());
+    b.send(Cmd::SetLive { enabled: false, interval: Duration::from_millis(500), screen: false });
+    b.send(Cmd::Connect { device, baud: 2_000_000 });
+    let sd = |op: SdOp| Cmd::Sd { op, direct, force: true };
+    let mut script = vec![sd(SdOp::List { path: "/".into() })];
+    let back = std::env::temp_dir().join(format!("m65-studio-sd-selftest-{}", std::process::id()));
+    if let Some(f) = &file {
+        let local = std::path::PathBuf::from(f);
+        let name = local.file_name().unwrap().to_string_lossy().into_owned();
+        let alloc = mega65::fat32::Allocation::for_name(&name);
+        script.push(sd(SdOp::Mkdir { path: "/STUDIOTEST".into() }));
+        script.push(sd(SdOp::Put { local: local.clone(), dir: "/STUDIOTEST".into(), alloc }));
+        script.push(sd(SdOp::Get { remote: format!("/STUDIOTEST/{name}"), local: back.clone() }));
+        script.push(sd(SdOp::Delete { path: "/STUDIOTEST".into() }));
+        script.push(sd(SdOp::List { path: "/".into() }));
+    }
+    script.push(sd(SdOp::Quit));
+    for c in script {
+        b.send(c);
+    }
+    let start = Instant::now();
+    let mut ops_left = if file.is_some() { 7 } else { 2 };
+    let mut failed = false;
+    let limit = Duration::from_secs(if direct { 1800 } else { 120 });
+    while start.elapsed() < limit && ops_left > 0 {
+        match b.rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(Event::SdListing { path, entries, free }) => {
+                println!("listing {path}: {} entries, free {free:?}", entries.len());
+                for e in entries.iter().take(12) {
+                    println!("  {:>10} | {} | {}", if e.is_dir() { "<DIR>".to_string() } else { e.size.to_string() }, e.mtime, e.name);
+                }
+            }
+            Ok(Event::SdDone(r)) => {
+                ops_left -= 1;
+                match r {
+                    Ok(m) => println!("ok: {m}"),
+                    Err(e) => {
+                        println!("FAILED: {e}");
+                        failed = true;
+                    }
+                }
+            }
+            Ok(Event::SdProgress(Some((d, t)))) if d == t || d % (64 * 1024) == 0 => println!("progress: {d}/{t}"),
+            Ok(Event::Error(e)) => println!("error: {e}"),
+            Ok(Event::Log(l)) => println!("log: {l}"),
+            Ok(Event::Disconnected) => {
+                println!("disconnected");
+                break;
+            }
+            Ok(Event::Connected { device, .. }) => println!("connected to {device} after {:.1} s", start.elapsed().as_secs_f32()),
+            Ok(Event::Registers { .. } | Event::Busy(_) | Event::SdProgress(_)) => {}
+            Ok(other) => println!("{other:?}"),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(_) => break,
+        }
+    }
+    if let Some(f) = &file {
+        match (std::fs::read(f), std::fs::read(&back)) {
+            (Ok(a), Ok(b)) if a == b => println!("round trip: {} bytes identical", a.len()),
+            (Ok(a), Ok(b)) => {
+                println!("ROUND TRIP MISMATCH: sent {} bytes, got {}", a.len(), b.len());
+                failed = true;
+            }
+            (_, Err(e)) => {
+                println!("ROUND TRIP: no file came back ({e})");
+                failed = true;
+            }
+            (Err(e), _) => println!("cannot read {f}: {e}"),
+        }
+        let _ = std::fs::remove_file(&back);
+    }
+    if ops_left > 0 {
+        println!("SELFTEST TIMED OUT ({ops_left} operations outstanding)");
+    } else if !failed {
+        println!("SD SELFTEST PASSED");
+    }
+    b.send(Cmd::Disconnect);
 }

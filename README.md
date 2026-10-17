@@ -194,8 +194,22 @@ builds the same on macOS, Windows and Linux):
   as the MEGA65 will show it with any errors or fixes, then Send BASIC, with
   optional RUN and DSAVE, a progress bar, and the read-back check; the file is
   re-read when it changes on disk, so edit on the PC and press Send again; Save
-  PRG… writes the tokenized program locally), and a console for raw monitor commands with the log. Addresses
-  typed anywhere may be symbol names, and disassembly shows labels.
+  PRG… writes the tokenized program locally), an SD card tab (browse the card's
+  folders with Open/Up buttons, Upload file… or drop a file on the window,
+  Download, Delete with a confirming second click, Create folder, and Mount for
+  a `.d81` in the root; uploads use the same contiguous-when-possible layout as
+  `m65rs sd put`, with the choice shown as three radio buttons, and report
+  whether the file landed in one piece; fast mode runs the mega65-tools helper
+  on the MEGA65 and Leave SD mode returns it to BASIC, gentle mode drives the SD
+  registers directly, slowly, pausing the CPU only during each transfer), and a
+  console for raw monitor commands with the log. Addresses typed anywhere may
+  be symbol names, and disassembly shows labels.
+
+`m65-studio --selftest-sd DEVICE [FILE] [direct]` exercises the SD tab's worker
+path without a window: list the root, and with a file, upload it to a
+`STUDIOTEST` folder, download it back, compare, and delete the folder. On Xemu
+only `direct` works, because the helper's serial replies go to Xemu's log, not
+to the monitor socket.
 
 All hardware traffic runs on one worker thread, so the UI never blocks and
 panels can't interleave commands. Settings persist between runs.

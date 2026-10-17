@@ -10,7 +10,7 @@ use egui::{Color32, RichText, TextureHandle, TextureOptions};
 use mega65::monitor::Registers;
 use mega65::{parse_hex, transport};
 
-use crate::backend::{Backend, Cmd, Event};
+use crate::backend::{Backend, Cmd, Event, SdOp};
 
 const MEM_VIEW: usize = 0;
 const MEM_VIEW_2: usize = 1;
@@ -53,6 +53,34 @@ struct Settings {
     search_end: String,
     search_width: u8,
     search_value: String,
+    /// SD tab: drive the SD controller directly instead of the helper program.
+    sd_direct: bool,
+    /// SD tab: let the helper replace a program that is loaded in memory.
+    sd_force: bool,
+    sd_layout: SdLayout,
+    /// Directory shown on the card.
+    sd_path: String,
+}
+
+/// How uploads lay files out on the card (see `mega65::fat32::Allocation`).
+#[derive(Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+enum SdLayout {
+    /// Contiguous when the card has room, else fragmented; disk images must be contiguous.
+    #[default]
+    Auto,
+    Contiguous,
+    Fragmented,
+}
+
+impl SdLayout {
+    fn allocation(self, name: &str) -> mega65::fat32::Allocation {
+        use mega65::fat32::Allocation;
+        match self {
+            SdLayout::Auto => Allocation::for_name(name),
+            SdLayout::Contiguous => Allocation::Contiguous,
+            SdLayout::Fragmented => Allocation::Any,
+        }
+    }
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -100,6 +128,10 @@ impl Default for Settings {
             search_end: "10000".into(),
             search_width: 1,
             search_value: String::new(),
+            sd_direct: false,
+            sd_force: false,
+            sd_layout: SdLayout::Auto,
+            sd_path: "/".into(),
         }
     }
 }
@@ -114,7 +146,27 @@ enum Tab {
     Search,
     Dma,
     Basic,
+    Sd,
     Console,
+}
+
+/// The SD card tab: the directory last listed and the transfer in progress.
+#[derive(Default)]
+struct SdState {
+    /// The directory the entries belong to (None until the first listing).
+    listed: Option<String>,
+    entries: Vec<mega65::fat32::DirEntry>,
+    /// (free clusters, total clusters, bytes per cluster) from the card.
+    free: Option<(u64, u64, u64)>,
+    /// An operation is running on the worker.
+    busy: bool,
+    progress: Option<(u64, u64)>,
+    result: Option<Result<String, String>>,
+    /// Name awaiting a second click on Delete.
+    confirm_delete: Option<String>,
+    new_dir: String,
+    /// The helper program has been started on the MEGA65 and not stopped since.
+    helper_up: bool,
 }
 
 /// The Search tab: the last result of the backend's memory search.
@@ -176,6 +228,7 @@ pub struct StudioApp {
     watch_edit: Option<(usize, String)>,
     basic: BasicState,
     search: SearchState,
+    sd: SdState,
 }
 
 /// The BASIC tab: the loaded source, its tokenized preview and the last send.
@@ -249,6 +302,7 @@ impl StudioApp {
             watch_edit: None,
             basic: BasicState::default(),
             search: SearchState::default(),
+            sd: SdState::default(),
         };
         app.watch_vals = vec![WatchState::default(); app.s.watches.len()];
         if !app.s.basic_path.is_empty() {
@@ -324,6 +378,9 @@ impl StudioApp {
                 Event::Disconnected => {
                     self.connected = false;
                     self.prof_on = false;
+                    self.sd.busy = false;
+                    self.sd.listed = None;
+                    self.sd.helper_up = false;
                     self.status = "not connected".into();
                     self.regs = None;
                     self.push_log("disconnected".into());
@@ -408,6 +465,22 @@ impl StudioApp {
                     self.push_log(format!("CPU stopped at ${:04X} (breakpoint/watchpoint)", r.pc));
                     self.stopped = true;
                     self.s.tab = Tab::Disassembly;
+                }
+                Event::SdListing { path, entries, free } => {
+                    self.s.sd_path = path.clone();
+                    self.sd.listed = Some(path);
+                    self.sd.entries = entries;
+                    self.sd.free = free;
+                    self.sd.confirm_delete = None;
+                }
+                Event::SdProgress(p) => self.sd.progress = p,
+                Event::SdDone(r) => {
+                    self.sd.busy = false;
+                    self.sd.progress = None;
+                    if let Err(e) = &r {
+                        self.last_error = Some(e.clone());
+                    }
+                    self.sd.result = Some(r);
                 }
             }
         }
@@ -1442,6 +1515,191 @@ impl StudioApp {
         });
     }
 
+    fn sd_send(&mut self, op: SdOp) {
+        self.sd.busy = true;
+        self.sd.result = None;
+        self.sd.confirm_delete = None;
+        if !self.s.sd_direct {
+            self.sd.helper_up = !matches!(op, SdOp::Quit);
+        }
+        self.backend.send(Cmd::Sd { op, direct: self.s.sd_direct, force: self.s.sd_force });
+    }
+
+    fn sd_upload(&mut self, local: PathBuf) {
+        let name = local.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let alloc = self.s.sd_layout.allocation(&name);
+        self.sd.progress = Some((0, 1));
+        self.sd_send(SdOp::Put { local, dir: self.s.sd_path.clone(), alloc });
+    }
+
+    fn sd_tab(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("Copy files between this computer and the SD card in the MEGA65. Uploads go into one unbroken run of clusters when the card has room, which disk images need before the MEGA65 can mount them.").weak().small());
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Transfer:");
+            ui.radio_value(&mut self.s.sd_direct, false, "fast (helper program)").on_hover_text("runs mega65-tools' remotesd helper on the MEGA65; about 160 KB/s");
+            ui.radio_value(&mut self.s.sd_direct, true, "gentle (direct, slow)").on_hover_text("drives the SD controller through the monitor; nothing in memory changes, but the CPU is paused during each transfer and it is many times slower");
+            if !self.s.sd_direct {
+                ui.checkbox(&mut self.s.sd_force, "replace the program in memory").on_hover_text("the helper is a C64 program at $0801; without this the transfer refuses to start while a program is loaded");
+            }
+            ui.separator();
+            ui.label("Layout:");
+            ui.radio_value(&mut self.s.sd_layout, SdLayout::Auto, "contiguous when possible").on_hover_text("one unbroken run when the card has one, otherwise fragmented; .d81/.d64/.d71/.d65 must be contiguous and fail otherwise");
+            ui.radio_value(&mut self.s.sd_layout, SdLayout::Contiguous, "must be contiguous").on_hover_text("fail, leaving the card unchanged, if there is no run of free clusters big enough");
+            ui.radio_value(&mut self.s.sd_layout, SdLayout::Fragmented, "fragmented is fine").on_hover_text("take free clusters in order, the way older versions did");
+        });
+        ui.label(
+            RichText::new(if self.s.sd_direct {
+                "Gentle mode pauses the MEGA65 while it reads or writes the card and resumes it afterwards. A game with music will stutter."
+            } else {
+                "Fast mode switches the MEGA65 to C64 mode and loads a small helper program, replacing whatever was in memory. It stays there between transfers; use Leave SD mode to get back to BASIC."
+            })
+            .weak()
+            .small(),
+        );
+        let en = self.connected && !self.busy && !self.sd.busy;
+        ui.horizontal(|ui| {
+            ui.label("Folder:");
+            let r = ui.add(egui::TextEdit::singleline(&mut self.s.sd_path).desired_width(240.0).hint_text("/"));
+            if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && en {
+                self.sd_send(SdOp::List { path: self.s.sd_path.clone() });
+            }
+            let at_root = self.s.sd_path.trim_matches('/').is_empty();
+            if ui.add_enabled(en && !at_root, egui::Button::new("Up")).clicked() {
+                let parent = match self.s.sd_path.trim_end_matches('/').rsplit_once('/') {
+                    Some(("", _)) | None => "/".to_string(),
+                    Some((d, _)) => d.to_string(),
+                };
+                self.sd_send(SdOp::List { path: parent });
+            }
+            if ui.add_enabled(en, egui::Button::new(if self.sd.listed.is_some() { "Refresh" } else { "Show card" })).clicked() {
+                self.sd_send(SdOp::List { path: self.s.sd_path.clone() });
+            }
+            ui.separator();
+            if ui.add_enabled(en, egui::Button::new(RichText::new("Upload file…").strong())).on_hover_text("copy a file from this computer into this folder").clicked() {
+                if let Some(p) = rfd::FileDialog::new().pick_file() {
+                    self.sd_upload(p);
+                }
+            }
+            ui.label(RichText::new("or drop a file on the window").weak().small());
+            ui.separator();
+            ui.add(egui::TextEdit::singleline(&mut self.sd.new_dir).desired_width(110.0).hint_text("new folder"));
+            if ui.add_enabled(en && !self.sd.new_dir.trim().is_empty(), egui::Button::new("Create folder")).clicked() {
+                let path = join_sd(&self.s.sd_path, self.sd.new_dir.trim());
+                self.sd.new_dir.clear();
+                self.sd_send(SdOp::Mkdir { path });
+            }
+            if self.sd.helper_up && !self.s.sd_direct {
+                ui.separator();
+                if ui.add_enabled(en, egui::Button::new("Leave SD mode")).on_hover_text("stop the helper program and return the MEGA65 to BASIC").clicked() {
+                    self.sd_send(SdOp::Quit);
+                }
+            }
+        });
+        if !self.connected {
+            ui.label(RichText::new("connect to a MEGA65 first").weak());
+        }
+        let red = Color32::from_rgb(230, 90, 90);
+        let green = Color32::from_rgb(90, 190, 90);
+        ui.horizontal(|ui| {
+            if let Some((done, total)) = self.sd.progress {
+                let f = if total > 0 { done as f32 / total as f32 } else { 0.0 };
+                ui.add(egui::ProgressBar::new(f).desired_width(260.0).text(format!("{} / {}", fmt_size(done), fmt_size(total))));
+            } else if self.sd.busy {
+                ui.spinner();
+                ui.label(RichText::new("talking to the card…").weak());
+            }
+            match &self.sd.result {
+                Some(Ok(m)) if !m.is_empty() => {
+                    ui.label(RichText::new(m).color(green));
+                }
+                Some(Err(e)) => {
+                    ui.label(RichText::new(e).color(red));
+                }
+                _ => {}
+            }
+        });
+        ui.separator();
+        let Some(listed) = self.sd.listed.clone() else {
+            if self.connected && !self.sd.busy {
+                ui.label(RichText::new("Press Show card to list the SD card's root folder.").weak());
+            }
+            return;
+        };
+        if let Some((free, total, bpc)) = self.sd.free {
+            ui.label(RichText::new(format!("{listed}   {} free of {}", fmt_size(free * bpc), fmt_size(total * bpc))).small());
+        } else {
+            ui.label(RichText::new(&listed).small());
+        }
+        let entries = self.sd.entries.clone();
+        let mut action: Option<SdOp> = None;
+        let mut confirm: Option<Option<String>> = None;
+        egui::ScrollArea::vertical().id_salt("sd_list").show(ui, |ui| {
+            egui::Grid::new("sdgrid").striped(true).spacing([12.0, 3.0]).min_col_width(60.0).show(ui, |ui| {
+                ui.label(RichText::new("Name").strong());
+                ui.label(RichText::new("Size").strong());
+                ui.label(RichText::new("Modified").strong());
+                ui.label("");
+                ui.end_row();
+                for e in &entries {
+                    let path = join_sd(&listed, &e.name);
+                    if e.is_dir() {
+                        ui.label(RichText::new(format!("📁 {}", e.name)).strong());
+                        ui.label("");
+                    } else {
+                        ui.label(&e.name);
+                        ui.label(RichText::new(fmt_size(e.size as u64)).monospace());
+                    }
+                    ui.label(RichText::new(&e.mtime).weak().small());
+                    ui.horizontal(|ui| {
+                        if e.is_dir() {
+                            if ui.add_enabled(en, egui::Button::new("Open")).clicked() {
+                                action = Some(SdOp::List { path: path.clone() });
+                            }
+                        } else {
+                            if ui.add_enabled(en, egui::Button::new("Download")).clicked() {
+                                if let Some(local) = rfd::FileDialog::new().set_file_name(&e.name).save_file() {
+                                    action = Some(SdOp::Get { remote: path.clone(), local });
+                                }
+                            }
+                            let is_d81 = e.name.to_ascii_lowercase().ends_with(".d81");
+                            if is_d81
+                                && listed.trim_matches('/').is_empty()
+                                && !self.s.sd_direct
+                                && ui.add_enabled(en, egui::Button::new("Mount")).on_hover_text("ask the Hypervisor to mount this disk image as drive 8").clicked()
+                            {
+                                action = Some(SdOp::Mount { name: e.name.clone() });
+                            }
+                        }
+                        if self.sd.confirm_delete.as_deref() == Some(path.as_str()) {
+                            let what = if e.is_dir() { "Delete folder and everything in it" } else { "Really delete" };
+                            if ui.add_enabled(en, egui::Button::new(RichText::new(what).color(red))).clicked() {
+                                action = Some(SdOp::Delete { path: path.clone() });
+                            }
+                            if ui.button("Cancel").clicked() {
+                                confirm = Some(None);
+                            }
+                        } else if ui.add_enabled(en, egui::Button::new("Delete")).clicked() {
+                            confirm = Some(Some(path.clone()));
+                        }
+                    });
+                    ui.end_row();
+                }
+            });
+            if entries.is_empty() {
+                ui.label(RichText::new("empty folder").weak());
+            }
+        });
+        if let Some(c) = confirm {
+            self.sd.confirm_delete = c;
+        }
+        if let Some(op) = action {
+            if matches!(op, SdOp::Get { .. }) {
+                self.sd.progress = Some((0, 1));
+            }
+            self.sd_send(op);
+        }
+    }
+
     fn console_tab(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label(RichText::new("monitor>").monospace());
@@ -1476,6 +1734,12 @@ impl eframe::App for StudioApp {
         // Dropped files load as PRGs.
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
         if let Some(p) = dropped.into_iter().next() {
+            if self.s.tab == Tab::Sd {
+                if self.connected && !self.sd.busy && p.is_file() {
+                    self.sd_upload(p);
+                }
+                return;
+            }
             if is_basic_source(&p) {
                 self.s.basic_path = p.display().to_string();
                 self.basic_reload();
@@ -1510,6 +1774,7 @@ impl eframe::App for StudioApp {
                 ui.selectable_value(&mut self.s.tab, Tab::Search, if self.search.started { format!("Search ({})", self.search.count) } else { "Search".to_string() });
                 ui.selectable_value(&mut self.s.tab, Tab::Dma, "DMA");
                 ui.selectable_value(&mut self.s.tab, Tab::Basic, "BASIC");
+                ui.selectable_value(&mut self.s.tab, Tab::Sd, if self.sd.busy { "SD card ●" } else { "SD card" });
                 ui.selectable_value(&mut self.s.tab, Tab::Console, "Console / Log");
             });
             ui.separator();
@@ -1522,9 +1787,31 @@ impl eframe::App for StudioApp {
                 Tab::Search => self.search_tab(ui),
                 Tab::Dma => self.dma_tab(ui),
                 Tab::Basic => self.basic_tab(ui),
+                Tab::Sd => self.sd_tab(ui),
                 Tab::Console => self.console_tab(ui),
             }
         });
+    }
+}
+
+/// `/GAMES` + `X.D81` -> `/GAMES/X.D81`.
+fn join_sd(dir: &str, name: &str) -> String {
+    if dir.ends_with('/') {
+        format!("{dir}{name}")
+    } else {
+        format!("{dir}/{name}")
+    }
+}
+
+fn fmt_size(n: u64) -> String {
+    if n < 1024 {
+        format!("{n} B")
+    } else if n < 1024 * 1024 {
+        format!("{:.1} KB", n as f64 / 1024.0)
+    } else if n < 1024 * 1024 * 1024 {
+        format!("{:.1} MB", n as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.2} GB", n as f64 / (1024.0 * 1024.0 * 1024.0))
     }
 }
 

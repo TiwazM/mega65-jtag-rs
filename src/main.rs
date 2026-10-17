@@ -1080,7 +1080,10 @@ fn sd_cmd(cli: &Cli, args: &SdArgs) -> anyhow::Result<()> {
         fs.close()?;
         r
     } else {
-        let mut dev = HelperSd::start(&mut mach, args.force)?;
+        let mut dev = HelperSd::start(&mut mach, args.force).map_err(|e| match e {
+            mega65::Error::Other(ref m) if m == mega65::sdcard::PROGRAM_LOADED => anyhow::anyhow!("{m} (use --force to replace it)"),
+            e => e.into(),
+        })?;
         if let Some(name) = args.cmd.is_mount() {
             dev.mount_d81(name)?;
             println!("asked the Hypervisor to mount {name}");

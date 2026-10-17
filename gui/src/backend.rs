@@ -9,9 +9,11 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use mega65::fat32::{Allocation, DirEntry, Fat32};
 use mega65::machine::{Machine, Prg, Versions};
 use mega65::monitor::{Monitor, Registers};
 use mega65::screen::VideoState;
+use mega65::sdcard::{BlockDevice, DirectSd, HelperSd};
 
 #[derive(Debug, Clone)]
 pub enum Cmd {
@@ -65,7 +67,28 @@ pub enum Cmd {
     /// filter refines the current one.
     SearchStep { filter: mega65::memsearch::Filter, start: Option<(Vec<(u32, usize)>, u8)> },
     SearchReset,
+    /// One SD card operation. `direct` drives the SD controller through the
+    /// monitor (slow, pauses the CPU, touches no memory); otherwise the
+    /// mega65-tools helper program is put in C64 memory and stays resident
+    /// until `SdOp::Quit`. `force` lets the helper replace a loaded program.
+    Sd { op: SdOp, direct: bool, force: bool },
     Shutdown,
+}
+
+/// What the SD tab asks for. Paths are absolute on the card (`/GAMES/X.D81`).
+#[derive(Debug, Clone)]
+pub enum SdOp {
+    List { path: String },
+    /// Upload a PC file into directory `dir` under its own file name.
+    Put { local: PathBuf, dir: String, alloc: Allocation },
+    Get { remote: String, local: PathBuf },
+    /// Delete a file, or a directory with everything in it.
+    Delete { path: String },
+    Mkdir { path: String },
+    /// Ask the Hypervisor to mount a D81 from the card's root directory.
+    Mount { name: String },
+    /// Stop the helper program and return the MEGA65 to BASIC.
+    Quit,
 }
 
 #[derive(Debug)]
@@ -97,6 +120,19 @@ pub enum Event {
     /// Memory search state after a step: how many addresses match, the first
     /// `hits.len()` of them, the width, and the step history.
     Search { count: usize, hits: Vec<mega65::memsearch::Hit>, width: u8, history: Vec<String> },
+    /// A directory of the SD card, with (free, total, bytes per cluster) if known.
+    SdListing { path: String, entries: Vec<DirEntry>, free: Option<(u64, u64, u64)> },
+    /// Transfer progress (done, total bytes), or None when finished.
+    SdProgress(Option<(u64, u64)>),
+    /// An SD operation finished: a one-line summary, or why it failed.
+    SdDone(Result<String, String>),
+}
+
+/// What an SD operation produced: a line for the user and, when the directory
+/// shown may have changed, its fresh listing.
+struct SdResult {
+    message: String,
+    listing: Option<(String, Vec<DirEntry>, Option<(u64, u64, u64)>)>,
 }
 
 /// Hits sent to the UI per search step; the count is always exact.
@@ -489,9 +525,84 @@ impl Worker {
                 self.interval = interval;
                 self.live_screen = screen;
             }
+            Cmd::Sd { op, direct, force } => {
+                // The profiler would fight the transfer for the link; pause it.
+                let was = self.prof_on;
+                self.prof_on = false;
+                let r = self.sd(&op, direct, force);
+                self.prof_on = was;
+                self.emit(Event::SdProgress(None));
+                match r {
+                    Ok(res) => {
+                        if let Some((path, entries, free)) = res.listing {
+                            self.emit(Event::SdListing { path, entries, free });
+                        }
+                        if !res.message.is_empty() {
+                            self.log(format!("SD: {}", res.message));
+                        }
+                        self.emit(Event::SdDone(Ok(res.message)));
+                    }
+                    Err(e) => {
+                        self.log(format!("SD: {e}"));
+                        self.emit(Event::SdDone(Err(e.to_string())));
+                        // A dead link is the likeliest cause of a timeout; verify with a sync.
+                        if self.mach.as_mut().map(|m| m.mon.sync().is_err()).unwrap_or(false) {
+                            self.mach = None;
+                            self.emit(Event::Disconnected);
+                        }
+                    }
+                }
+            }
             Cmd::Shutdown => {}
         }
         Ok(())
+    }
+
+    /// Run one SD operation: open the card (through the helper or directly),
+    /// do the work, close it again. The helper stays resident between calls so
+    /// the next one starts quickly; `SdOp::Quit` ends it.
+    fn sd(&mut self, op: &SdOp, direct: bool, force: bool) -> mega65::Result<SdResult> {
+        let tx = self.tx.clone();
+        let ctx = self.ctx.clone();
+        let mut progress = move |done: u64, total: u64| {
+            let _ = tx.send(Event::SdProgress(Some((done, total))));
+            ctx.request_repaint();
+        };
+        let m = self.mach()?;
+        if direct {
+            if matches!(op, SdOp::Quit) {
+                return Ok(SdResult { message: String::new(), listing: None });
+            }
+            if matches!(op, SdOp::Mount { .. }) {
+                return Err(mega65::Error::Other("mounting a disk image needs the fast (helper) mode".into()));
+            }
+            let dev = DirectSd::new(&mut m.mon);
+            let mut fs = Fat32::open(dev)?;
+            let r = sd_op(&mut fs, op, &mut progress);
+            fs.close()?;
+            return r;
+        }
+        let mut dev = HelperSd::start(m, force).map_err(|e| match e {
+            mega65::Error::Other(ref s) if s == mega65::sdcard::PROGRAM_LOADED => {
+                mega65::Error::Other(format!("{s}; tick \"replace the program in memory\" to go ahead"))
+            }
+            e => e,
+        })?;
+        match op {
+            SdOp::Quit => {
+                dev.quit()?;
+                return Ok(SdResult { message: "SD helper stopped; the MEGA65 is back in BASIC".into(), listing: None });
+            }
+            SdOp::Mount { name } => {
+                dev.mount_d81(name)?;
+                return Ok(SdResult { message: format!("asked the Hypervisor to mount {name}"), listing: None });
+            }
+            _ => {}
+        }
+        let mut fs = Fat32::open(dev)?;
+        let r = sd_op(&mut fs, op, &mut progress);
+        fs.close()?;
+        r
     }
 
     /// One profiler period: count frame-flag changes for 200 ms (if a flag is
@@ -683,6 +794,60 @@ impl Worker {
         }
         self.emit(Event::Screen { width: 720, height: vs.height(), rgb, text: vs.to_text() });
         Ok(())
+    }
+}
+
+/// The filesystem side of an SD operation, the same for either block device.
+fn sd_op<D: BlockDevice>(fs: &mut Fat32<D>, op: &SdOp, progress: &mut impl FnMut(u64, u64)) -> mega65::Result<SdResult> {
+    let listing = |fs: &mut Fat32<D>, path: &str| -> mega65::Result<(String, Vec<DirEntry>, Option<(u64, u64, u64)>)> {
+        let entries = fs.list(Some(path), false)?;
+        let free = fs.df(false).ok();
+        Ok((path.to_string(), entries, free))
+    };
+    let join = |dir: &str, name: &str| if dir.ends_with('/') { format!("{dir}{name}") } else { format!("{dir}/{name}") };
+    match op {
+        SdOp::List { path } => Ok(SdResult { message: String::new(), listing: Some(listing(fs, path)?) }),
+        SdOp::Put { local, dir, alloc } => {
+            let name = local.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            if name.is_empty() {
+                return Err(mega65::Error::Other(format!("{}: not a file", local.display())));
+            }
+            let data = std::fs::read(local)?;
+            let remote = join(dir, &name);
+            fs.write_file_with(&remote, &data, *alloc, &mut *progress)?;
+            let e = fs.lookup(&remote)?.ok_or_else(|| mega65::Error::Other("file missing after upload".into()))?;
+            let chain = fs.chain(e.cluster)?;
+            let runs = 1 + chain.windows(2).filter(|w| w[1] != w[0] + 1).count();
+            let layout = match runs {
+                1 => format!("in one piece: {} clusters from {}", chain.len(), chain[0]),
+                n => format!("fragmented into {n} pieces"),
+            };
+            Ok(SdResult { message: format!("uploaded {name} ({} bytes) {layout}", data.len()), listing: Some(listing(fs, dir)?) })
+        }
+        SdOp::Get { remote, local } => {
+            let data = fs.read_file(remote, &mut *progress)?;
+            std::fs::write(local, &data)?;
+            Ok(SdResult { message: format!("downloaded {remote} ({} bytes) to {}", data.len(), local.display()), listing: None })
+        }
+        SdOp::Delete { path } => {
+            fs.delete(path, true)?;
+            let dir = parent_dir(path);
+            Ok(SdResult { message: format!("deleted {path}"), listing: Some(listing(fs, &dir)?) })
+        }
+        SdOp::Mkdir { path } => {
+            fs.mkdir(path)?;
+            let dir = parent_dir(path);
+            Ok(SdResult { message: format!("created {path}"), listing: Some(listing(fs, &dir)?) })
+        }
+        SdOp::Mount { .. } | SdOp::Quit => unreachable!("handled before the filesystem is opened"),
+    }
+}
+
+/// `/A/B/C.D81` -> `/A/B`; `/X` -> `/`.
+fn parent_dir(path: &str) -> String {
+    match path.trim_end_matches('/').rsplit_once('/') {
+        Some(("", _)) | None => "/".into(),
+        Some((d, _)) => d.to_string(),
     }
 }
 

@@ -31,6 +31,10 @@ const HELPER_JOBS: u32 = 0xc000;
 /// Two 64 KB staging banks: one being written to the card while the other fills.
 const HELPER_STAGING: [u32; 2] = [0x50000, 0x40000];
 
+/// The error [`HelperSd::start`] gives when a program is in memory and `force`
+/// is off; callers add their own hint about how to override it.
+pub const PROGRAM_LOADED: &str = "a program is loaded on the MEGA65 and the SD helper would overwrite it";
+
 pub trait BlockDevice {
     fn read_sectors(&mut self, first: u32, count: usize) -> Result<Vec<u8>>;
     fn write_sector(&mut self, sector: u32, data: &[u8]) -> Result<()>;
@@ -144,6 +148,8 @@ pub struct HelperSd<'a> {
     inflight: bool,
     /// Pipeline uploads with card writes (`M65_SD_NO_PIPELINE=1` disables).
     pub pipeline: bool,
+    /// The monitor's `load_without_halt` before we took over, restored on close.
+    prev_load_without_halt: bool,
 }
 
 impl<'a> HelperSd<'a> {
@@ -164,9 +170,7 @@ impl<'a> HelperSd<'a> {
             let p = if mach.mode.is_c64_like() { 0x0801 } else { 0x2001 };
             let link = mach.mon.read_memory(p, 2)?;
             if link != [0, 0] {
-                return Err(Error::Other(
-                    "a program is loaded on the MEGA65; the SD helper would overwrite it (use --force)".into(),
-                ));
+                return Err(Error::Other(PROGRAM_LOADED.into()));
             }
         }
         if !mach.mode.is_c64_like() {
@@ -254,6 +258,7 @@ impl<'a> HelperSd<'a> {
 impl<'a> HelperSd<'a> {
     fn wrap(mon: &'a mut Monitor) -> Self {
         let pipeline = std::env::var_os("M65_SD_NO_PIPELINE").is_none();
+        let prev_load_without_halt = mon.load_without_halt;
         mon.load_without_halt = pipeline;
         Self {
             mon,
@@ -262,6 +267,7 @@ impl<'a> HelperSd<'a> {
             bank: 0,
             inflight: false,
             pipeline,
+            prev_load_without_halt,
         }
     }
 
@@ -395,7 +401,9 @@ impl BlockDevice for HelperSd<'_> {
 
     fn close(&mut self) -> Result<()> {
         self.flush()?;
-        self.wait_inflight()
+        self.wait_inflight()?;
+        self.mon.load_without_halt = self.prev_load_without_halt;
+        Ok(())
     }
 }
 
