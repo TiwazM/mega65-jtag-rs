@@ -95,7 +95,7 @@ runs N frames between them, so `m65rs search ? + + + --frames 30` lists every
 counter in one go.
 
 The CPU is never stopped and nothing is written: the first snapshot reads the
-whole range (64 KB in about half a second on the real machine; a snapshot is
+whole range (64 KB in about 3 s on the real machine without halting; a snapshot is
 not one instant, but a value caught mid-change is sorted out by the next step)
 and later steps read only the survivors' neighbourhoods, so they are a few
 monitor round trips. Studio's Search tab has the same filters as buttons, a
