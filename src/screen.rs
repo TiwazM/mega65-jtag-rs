@@ -35,6 +35,12 @@ pub struct VideoState {
     pub screen: Vec<u8>,
     pub colour: Vec<u8>,
     pub charset: Vec<u8>,
+    /// Full-colour glyph and bitmap data, in 256-byte blocks keyed by address,
+    /// read during `capture` so a paused capture covers it too.
+    glyphs: std::collections::HashMap<u32, Vec<u8>>,
+    /// The screen pointer ($D060-$D062) changed while capturing: the program
+    /// flips between screen buffers, so an unpaused capture mixes two frames.
+    pub flipped: bool,
     chargen_x: i32,
     chargen_y: i32,
     top_border: i32,
@@ -107,7 +113,7 @@ impl VideoState {
         let colour = mon.read_memory(COLOUR_RAM + colour_addr, screen_size)?;
         let charset = mon.read_memory(charset_addr, charset_size)?;
 
-        Ok(VideoState {
+        let mut vs = VideoState {
             screen_addr,
             charset_addr,
             colour_addr,
@@ -136,8 +142,69 @@ impl VideoState {
             screen,
             colour,
             charset,
+            glyphs: Default::default(),
+            flipped: false,
             regs,
-        })
+        };
+        vs.fetch_glyphs(mon)?;
+        let ptr = mon.read_memory(VIC_BASE + 0x60, 3)?;
+        vs.flipped = ptr[..] != vs.regs[0x60..0x63];
+        Ok(vs)
+    }
+
+    /// Read the full-colour glyphs and bitmap bytes the screen refers to, merging
+    /// neighbouring 256-byte blocks into one read.
+    fn fetch_glyphs(&mut self, mon: &mut Monitor) -> Result<()> {
+        let mut blocks = std::collections::BTreeSet::new();
+        for cy in 0..self.rows {
+            let mut fcm_yoffs: i32 = 0;
+            for cx in 0..self.width {
+                let (ch, col) = self.cell(cx, cy);
+                if col & 0x1000 != 0 {
+                    let yo = ((ch >> 13) & 7) as i32;
+                    fcm_yoffs = if ch & 0x1000 != 0 { -yo } else { yo };
+                    continue;
+                }
+                let char_id = if self.ebc { (ch & 0x3f) as usize } else { (ch & 0x1fff) as usize };
+                for row in 0..8 {
+                    if self.full_colour(char_id) {
+                        blocks.insert(self.fcm_addr(char_id, row, fcm_yoffs) & !0xff);
+                    } else if self.bitmap {
+                        blocks.insert(self.bitmap_addr(cx, cy, row) & !0xff);
+                    }
+                }
+            }
+        }
+        let blocks: Vec<u32> = blocks.into_iter().collect();
+        let mut i = 0;
+        while i < blocks.len() {
+            let mut j = i + 1;
+            while j < blocks.len() && blocks[j] == blocks[j - 1] + 0x100 {
+                j += 1;
+            }
+            let data = mon.read_memory(blocks[i], (j - i) * 0x100)?;
+            for (k, chunk) in data.chunks(0x100).enumerate() {
+                self.glyphs.insert(blocks[i + k], chunk.to_vec());
+            }
+            i = j;
+        }
+        Ok(())
+    }
+
+    fn full_colour(&self, char_id: usize) -> bool {
+        (self.regs[0x54] & 2 != 0 && char_id < 0x100) || (self.regs[0x54] & 4 != 0 && char_id > 0xff)
+    }
+
+    fn fcm_addr(&self, char_id: usize, row: usize, fcm_yoffs: i32) -> u32 {
+        (char_id as i64 * 64 + (row as i64 + fcm_yoffs as i64) * 8).max(0) as u32
+    }
+
+    fn bitmap_addr(&self, cx: usize, cy: usize, row: usize) -> u32 {
+        if self.h640 {
+            (self.charset_addr & 0xfc000) + (cx * 8 + cy * 640 + row) as u32
+        } else {
+            (self.charset_addr & 0xfe000) + (cx * 8 + cy * 320 + row) as u32
+        }
     }
 
     pub fn height(&self) -> usize {
@@ -229,8 +296,8 @@ impl VideoState {
         s
     }
 
-    /// Render to a 720 x (576|480) RGB framebuffer. Full-colour glyph data not in
-    /// the fetched charset is read from the machine on demand through `mon`.
+    /// Render to a 720 x (576|480) RGB framebuffer. Glyph data `capture` did not
+    /// fetch is read from the machine on demand through `mon`.
     pub fn render(&self, mon: &mut Monitor) -> Result<Vec<u8>> {
         let h = self.height();
         let mut fb = vec![0u8; 720 * h * 3];
@@ -253,7 +320,7 @@ impl VideoState {
             fb[o..o + 3].copy_from_slice(&[c.0, c.1, c.2]);
         };
 
-        let mut fcm_cache: std::collections::HashMap<u32, Vec<u8>> = Default::default();
+        let mut fcm_cache = self.glyphs.clone();
         let mut y_pos = self.chargen_y;
         for cy in 0..self.rows {
             if y_pos >= h as i32 {
@@ -309,7 +376,7 @@ impl VideoState {
                     background = v >> 4;
                     bitmap_multi = self.colour[cy * self.line_step + cx * if self.sixteen_bit { 2 } else { 1 }];
                 }
-                let full_colour = (self.regs[0x54] & 2 != 0 && char_id < 0x100) || (self.regs[0x54] & 4 != 0 && char_id > 0xff);
+                let full_colour = self.full_colour(char_id);
                 let four_bit = col & 0x800 != 0;
                 if col & 0x400 != 0 {
                     width_deduct += 8;
@@ -320,7 +387,7 @@ impl VideoState {
                     let row = if flip_v { 7 - yy } else { yy } as usize;
                     let mut g = [0u8; 8];
                     if full_colour {
-                        let addr = (char_id as i64 * 64 + (row as i64 + fcm_yoffs as i64) * 8).max(0) as u32;
+                        let addr = self.fcm_addr(char_id, row, fcm_yoffs);
                         let base = addr & !0xff;
                         if !fcm_cache.contains_key(&base) {
                             fcm_cache.insert(base, mon.read_memory(base, 256)?);
@@ -333,11 +400,7 @@ impl VideoState {
                             *gi = if (b >> i) & 1 != 0 { 0xff } else { 0 };
                         }
                     } else {
-                        let addr = if self.h640 {
-                            (self.charset_addr & 0xfc000) + (cx * 8 + cy * 640 + row) as u32
-                        } else {
-                            (self.charset_addr & 0xfe000) + (cx * 8 + cy * 320 + row) as u32
-                        };
+                        let addr = self.bitmap_addr(cx, cy, row);
                         let base = addr & !0xff;
                         if !fcm_cache.contains_key(&base) {
                             fcm_cache.insert(base, mon.read_memory(base, 256)?);

@@ -669,6 +669,9 @@ impl Worker {
         }
         let vs = if pause { m.mon.with_cpu_paused(VideoState::capture)? } else { VideoState::capture(&mut m.mon)? };
         let rgb = vs.render(&mut m.mon)?;
+        if vs.flipped && !pause {
+            self.log("the program flipped screen buffers during the capture, so parts of the picture come from a frame being drawn; tick \"Pause CPU while capturing\" for a clean frame".to_string());
+        }
         if let Some(p) = png {
             let mut f = std::fs::File::create(&p)?;
             let mut enc = png::Encoder::new(&mut f, 720, vs.height() as u32);
