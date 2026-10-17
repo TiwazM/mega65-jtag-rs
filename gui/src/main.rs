@@ -275,25 +275,31 @@ fn selftest_vf011(device: String, d81: String) {
 /// through the Screen tab's key path (egui key events -> `KeyState` ->
 /// `HoldKeys`): clears the screen, types `PRINT 1+2`, moves left onto the 1 and types 4, RETURN,
 /// then HOME, right onto the 4, 5 and RETURN (`PRINT 5+2`, 7), then cursor up twice
-/// (the cursor row printed should drop by 2).
+/// (the cursor row should drop by 2), then holds cursor right for 1.5 s (the
+/// column should run well past 1). Runs with live screen capture on.
 fn selftest_keys(device: String) {
     use backend::{Backend, Cmd, Event};
     use egui::Key;
     use std::time::Duration;
     let ctx = egui::Context::default();
     let b = Backend::start(ctx);
-    b.send(Cmd::SetLive { enabled: false, interval: Duration::from_millis(500), screen: false });
+    // Live polling with screen capture on, as in Studio with Auto ticked: a
+    // capture must not hold a key down long enough to auto-repeat.
+    b.send(Cmd::SetLive { enabled: true, interval: Duration::from_millis(500), screen: true });
     b.send(Cmd::Connect { device, baud: 2_000_000 });
     let mut keys = keys::KeyState::default();
-    let mut press = |key: Key, shift: bool| {
+    // Typing speed: each key held 90 ms, 120 ms between keys.
+    let mut key_for = |key: Key, shift: bool, hold: Duration| {
         for pressed in [true, false] {
             let e = egui::Event::Key { key, physical_key: Some(key), pressed, repeat: false, modifiers: egui::Modifiers { shift, ..Default::default() } };
             assert!(keys.event(&e), "{key:?} not handled");
             if let Some(k) = keys.changed() {
                 b.send(Cmd::HoldKeys(k));
             }
+            std::thread::sleep(if pressed { hold } else { Duration::from_millis(120) });
         }
     };
+    let mut press = |key: Key, shift: bool| key_for(key, shift, Duration::from_millis(90));
     press(Key::Home, true); // shift + HOME clears the screen
     let typed = [Key::P, Key::R, Key::I, Key::N, Key::T, Key::Space, Key::Num1];
     for k in typed {
@@ -323,20 +329,29 @@ fn selftest_keys(device: String) {
     }
     std::thread::sleep(Duration::from_millis(300));
     b.send(Cmd::Refresh);
+    // Hold cursor right for 1.5 s: the MEGA65's own key repeat should move the
+    // cursor column ($EC) well past 1.
+    b.send(Cmd::Memory { id: 1, addr: 0xec, len: 1 });
+    key_for(Key::ArrowRight, false, Duration::from_millis(1500));
+    std::thread::sleep(Duration::from_millis(300));
+    b.send(Cmd::Refresh);
+    b.send(Cmd::SetLive { enabled: false, interval: Duration::from_millis(500), screen: false });
     b.send(Cmd::Screenshot { pause: false });
     b.send(Cmd::Disconnect);
+    let (mut screen, mut rows, mut cols) = (String::new(), Vec::new(), Vec::new());
     loop {
         match b.rx.recv_timeout(Duration::from_secs(30)) {
-            Ok(Event::Screen { text, .. }) => {
-                let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-                for l in lines.iter().rev().take(6).rev() {
-                    println!("| {}", l.trim_end());
-                }
-            }
-            Ok(Event::Memory { addr: 0xeb, data, .. }) => println!("cursor row {}", data[0]),
+            Ok(Event::Screen { text, .. }) => screen = text,
+            Ok(Event::Memory { addr: 0xeb, data, .. }) if rows.last() != Some(&data[0]) => rows.push(data[0]),
+            Ok(Event::Memory { addr: 0xec, data, .. }) if cols.last() != Some(&data[0]) => cols.push(data[0]),
             Ok(Event::Error(e)) => println!("error: {e}"),
             Ok(Event::Disconnected) | Err(_) => break,
             Ok(_) => {}
         }
     }
+    let lines: Vec<&str> = screen.lines().filter(|l| !l.trim().is_empty()).collect();
+    for l in lines.iter().rev().take(6).rev() {
+        println!("| {}", l.trim_end());
+    }
+    println!("cursor rows seen {rows:?}, columns seen {cols:?}");
 }

@@ -257,24 +257,48 @@ impl Worker {
         self.emit(Event::Log(s.into()));
     }
 
+    /// Handle every command already queued (between profiler or virtual drive
+    /// bursts, so a key press and its release don't each wait a burst). False
+    /// when the worker should exit.
+    fn drain_commands(&mut self, busy: bool) -> bool {
+        loop {
+            match self.rx.try_recv() {
+                Ok(Cmd::Shutdown) => return false,
+                Ok(cmd) => {
+                    // Key presses are frequent and quick; don't flash the UI busy.
+                    let busy = busy && !matches!(cmd, Cmd::HoldKeys(_));
+                    if busy {
+                        self.emit(Event::Busy(true));
+                    }
+                    if let Err(e) = self.handle(cmd) {
+                        self.emit(Event::Error(e.to_string()));
+                    }
+                    if busy {
+                        self.emit(Event::Busy(false));
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => return false,
+                Err(std::sync::mpsc::TryRecvError::Empty) => return true,
+            }
+        }
+    }
+
     fn run(mut self) {
         loop {
             if self.prof_on && self.mach.is_some() {
                 // Profiling owns the link: sample for half a second, then look
                 // for commands, and repeat.
-                if let Err(e) = self.profile_burst() {
-                    self.emit(Event::Error(e.to_string()));
-                    self.prof_on = false;
-                }
-                match self.rx.try_recv() {
-                    Ok(Cmd::Shutdown) => break,
-                    Ok(cmd) => {
-                        if let Err(e) = self.handle(cmd) {
-                            self.emit(Event::Error(e.to_string()));
-                        }
+                // (Not while keys are held, so their release isn't delayed.)
+                if self.held_keys.is_empty() {
+                    if let Err(e) = self.profile_burst() {
+                        self.emit(Event::Error(e.to_string()));
+                        self.prof_on = false;
                     }
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
-                    Err(_) => {}
+                } else {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                if !self.drain_commands(false) {
+                    break;
                 }
                 continue;
             }
@@ -286,19 +310,10 @@ impl Worker {
                     self.vf011 = None;
                     self.emit(Event::Vf011 { serving: None, reads: 0, writes: 0, note: Some(format!("stopped: {e}")) });
                 }
-                match self.rx.try_recv() {
-                    Ok(Cmd::Shutdown) => break,
-                    Ok(cmd) => {
-                        self.emit(Event::Busy(true));
-                        if let Err(e) = self.handle(cmd) {
-                            self.emit(Event::Error(e.to_string()));
-                        }
-                        self.emit(Event::Busy(false));
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
-                    Err(_) => {}
+                if !self.drain_commands(true) {
+                    break;
                 }
-                if self.live && self.mach.is_some() && self.last_poll.elapsed() >= self.interval {
+                if self.poll_due() {
                     if let Err(e) = self.poll() {
                         self.emit(Event::Error(e.to_string()));
                     }
@@ -336,7 +351,7 @@ impl Worker {
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break,
             }
-            if self.live && self.mach.is_some() && self.last_poll.elapsed() >= self.interval {
+            if self.poll_due() {
                 if let Err(e) = self.poll() {
                     self.emit(Event::Error(e.to_string()));
                     if self.mach.as_mut().map(|m| m.mon.sync().is_err()).unwrap_or(false) {
@@ -827,6 +842,13 @@ impl Worker {
         }
         self.emit(Event::Watches(vals));
         Ok(())
+    }
+
+    /// Time for a live poll? Not while keys are held: a poll (a screen capture
+    /// especially) can take a second, and the key's release would wait behind
+    /// it long enough for the MEGA65 to auto-repeat the key.
+    fn poll_due(&self) -> bool {
+        self.live && self.mach.is_some() && self.held_keys.is_empty() && self.last_poll.elapsed() >= self.interval
     }
 
     fn poll(&mut self) -> mega65::Result<()> {

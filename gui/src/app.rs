@@ -226,6 +226,8 @@ pub struct StudioApp {
     screen_text: String,
     /// Screen tab: PC key presses go to the MEGA65 while the screen has focus.
     send_keys: bool,
+    /// The screen had keyboard focus with Send keys on (last frame).
+    keys_focused: bool,
     keys: crate::keys::KeyState,
     log: VecDeque<String>,
     console_in: String,
@@ -306,6 +308,7 @@ impl StudioApp {
             screen_tex: None,
             screen_text: String::new(),
             send_keys: false,
+            keys_focused: false,
             keys: Default::default(),
             log: VecDeque::new(),
             console_in: String::new(),
@@ -992,6 +995,13 @@ impl StudioApp {
                 .on_hover_text("while the screen below has focus, keys you press (cursor keys, RETURN, SPACE, TAB, letters, F-keys, ESC = RUN/STOP) are held on the MEGA65's keyboard; ⌘ shortcuts stay with Studio. Click the screen to send keys, click anywhere else to stop.")
                 .changed()
                 && self.send_keys;
+            // Status sits up here (from the last frame) so the screen below
+            // never changes size as focus comes and goes.
+            if self.keys_focused {
+                ui.label(RichText::new("keys go to the MEGA65; click outside the screen to stop").color(Color32::from_rgb(90, 200, 120)).small());
+            } else if self.send_keys && self.connected {
+                ui.label(RichText::new("click the screen to send keys").weak().small());
+            }
         });
         let avail = ui.available_size();
         let resp = if let Some(t) = &self.screen_tex {
@@ -1025,12 +1035,12 @@ impl StudioApp {
                 })
             });
             ui.painter().rect_stroke(resp.rect.expand(2.0), 2.0, egui::Stroke::new(2.0_f32, Color32::from_rgb(90, 200, 120)));
-            ui.label(RichText::new("⌨ keys go to the MEGA65 (click outside the screen to stop)").color(Color32::from_rgb(90, 200, 120)).small());
         } else {
             self.keys.release_all();
-            if self.send_keys && self.connected {
-                ui.label(RichText::new("click the screen to send keys").weak().small());
-            }
+        }
+        if capturing != self.keys_focused {
+            self.keys_focused = capturing;
+            ui.ctx().request_repaint();
         }
         self.sync_keys();
     }
