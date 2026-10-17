@@ -25,6 +25,6 @@ crossterm = "0.28"
 libc = "0.2"
 png = "0.17"
 rand = "0.8"
-rusb = "0.9"
+rusb = { version = "0.9", features = ["vendored"] }  # bundled libusb, so release builds need no Homebrew/system libusb
 serialport = { version = "4", default-features = false }
 thiserror = "1"

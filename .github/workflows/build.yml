@@ -1,0 +1,98 @@
+# Builds and tests m65rs and MEGA65 Studio on macOS, Windows and Linux.
+#
+# - Every push to master (and every pull request): build + test on all three.
+#   The finished zips are kept for 30 days under "Artifacts" on the run's page.
+# - Pushing a tag that starts with "v" (e.g. v0.1.0): the same, and then a
+#   GitHub Release with that name is created with the three downloads attached.
+name: Build
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch: # adds a "Run workflow" button on the Actions tab
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false # a Windows failure should not hide the Linux result
+      matrix:
+        include:
+          - os: macos-latest
+            name: macos-arm64
+          - os: windows-latest
+            name: windows-x64
+          - os: ubuntu-22.04
+            name: linux-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same Rust version as the Homebrew cargo on Steve's Mac (rust-version in Cargo.toml).
+      - uses: dtolnay/rust-toolchain@1.83.0
+      - uses: Swatinem/rust-cache@v2
+
+      # Headers the GUI (eframe: X11/Wayland/OpenGL) and the USB code need on Linux.
+      - name: Install Linux packages
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libudev-dev libxkbcommon-dev \
+            libgl1-mesa-dev libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev
+
+      - name: Build
+        run: cargo build --release --locked --workspace
+
+      - name: Test
+        run: cargo test --release --locked --workspace
+
+      # ---- package the downloads ----
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          gui/macos/build-app.sh
+          mkdir -p dist/pkg
+          cp -R "target/macos/MEGA65 Studio.app" target/release/m65rs README.md dist/pkg/
+          ditto -c -k dist/pkg "dist/mega65-tools-${{ github.ref_name }}-${{ matrix.name }}.zip"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/pkg | Out-Null
+          Copy-Item target/release/m65rs.exe, target/release/m65-studio.exe, README.md dist/pkg/
+          Compress-Archive -Path dist/pkg/* -DestinationPath "dist/mega65-tools-${{ github.ref_name }}-${{ matrix.name }}.zip"
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p dist/pkg
+          cp target/release/m65rs target/release/m65-studio README.md dist/pkg/
+          tar -czf "dist/mega65-tools-${{ github.ref_name }}-${{ matrix.name }}.tar.gz" -C dist/pkg .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/mega65-tools-*
+          retention-days: 30
+
+  release:
+    # Only for tags like v0.1.0, and only when all three builds succeeded.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # allowed to create the Release
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" dist/* --repo "${{ github.repository }}" --title "${{ github.ref_name }}" --generate-notes
