@@ -939,7 +939,7 @@ impl StudioApp {
             if let Some(r) = &self.regs {
                 let _ = r;
             }
-            ui.label(RichText::new("values refresh on every live poll (and during profiling); click a value to change it").weak().small());
+            ui.label(RichText::new("values refresh on every live poll (and during profiling); press Set… (or click the value) to change it").weak().small());
         });
         let now = std::time::Instant::now();
         let mut remove: Option<usize> = None;
@@ -973,11 +973,18 @@ impl StudioApp {
                         Some(v) => {
                             if let Some((ei, text)) = &mut self.watch_edit {
                                 if *ei == i {
-                                    let r = ui.add(egui::TextEdit::singleline(text).desired_width(50.0).font(egui::TextStyle::Monospace));
-                                    r.request_focus();
-                                    if ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
-                                        if let (Ok(nv), Some(a)) = (u32::from_str_radix(text.trim().trim_start_matches('$'), 16), st.addr) {
-                                            write = Some((a, width, nv));
+                                    let mut ok = false;
+                                    ui.horizontal(|ui| {
+                                        let r = ui.add(egui::TextEdit::singleline(text).desired_width(60.0).font(egui::TextStyle::Monospace).hint_text("new value"))
+                                            .on_hover_text("decimal, or $ followed by hex; Enter writes it, Esc cancels");
+                                        r.request_focus();
+                                        ok = ui.small_button("OK").clicked();
+                                    });
+                                    if ok || ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
+                                        match (mega65::parse_num(text), st.addr) {
+                                            (Ok(nv), Some(a)) => write = Some((a, width, nv)),
+                                            (Err(e), _) => self.last_error = Some(e),
+                                            _ => {}
                                         }
                                         self.watch_edit = None;
                                     } else if ui.input(|inp| inp.key_pressed(egui::Key::Escape)) {
@@ -994,9 +1001,14 @@ impl StudioApp {
                                 }
                             }
                             let hex = if width == 2 { format!("${v:04X}") } else { format!("${v:02X}") };
-                            let r = ui.add(egui::Label::new(RichText::new(hex).monospace().color(colour).strong()).sense(egui::Sense::click()));
-                            if r.clicked() && en {
-                                self.watch_edit = Some((i, if width == 2 { format!("{v:04X}") } else { format!("{v:02X}") }));
+                            let mut edit = false;
+                            ui.horizontal(|ui| {
+                                let r = ui.add(egui::Label::new(RichText::new(hex).monospace().color(colour).strong()).sense(egui::Sense::click()));
+                                edit |= r.clicked();
+                                edit |= ui.add_enabled(en, egui::Button::new("Set…").small()).on_hover_text("write a new value to this address").clicked();
+                            });
+                            if edit && en {
+                                self.watch_edit = Some((i, format!("{v}")));
                             }
                             ui.label(RichText::new(format!("{v}")).monospace().color(colour));
                             ui.label(RichText::new(if width == 2 { format!("{:08b} {:08b}", v >> 8, v & 0xff) } else { format!("{v:08b}") }).monospace().color(colour).small());
