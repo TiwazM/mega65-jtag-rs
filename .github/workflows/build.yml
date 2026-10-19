@@ -38,13 +38,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.83.0
       - uses: Swatinem/rust-cache@v2
 
-      # Headers the GUI (eframe: X11/Wayland/OpenGL) and the USB code need on Linux.
+      # Headers the GUI (eframe: X11/Wayland/OpenGL), the USB code, HDMI live
+      # (V4L2 bindings via bindgen/libclang) and its sound (ALSA) need on Linux.
       - name: Install Linux packages
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y pkg-config libudev-dev libxkbcommon-dev \
-            libgl1-mesa-dev libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev
+            libgl1-mesa-dev libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+            libasound2-dev libclang-dev
 
       - name: Build
         run: cargo build --release --locked --workspace

@@ -4,9 +4,13 @@
 use egui::{Color32, RichText, TextureHandle, TextureOptions};
 use mega65::live::{self, LiveDevice, LiveStream};
 
+use crate::live_audio::LiveAudio;
+
 #[derive(Default)]
 pub struct LiveView {
     stream: Option<LiveStream>,
+    audio: Option<LiveAudio>,
+    audio_error: Option<String>,
     tex: Option<TextureHandle>,
     seen: Option<u64>,
     devices: Option<Result<Vec<LiveDevice>, String>>,
@@ -53,6 +57,7 @@ impl LiveView {
 
     pub fn stop(&mut self) {
         self.stream = None;
+        self.audio = None;
         self.note = None;
     }
 
@@ -75,6 +80,48 @@ impl LiveView {
         if s.finished() {
             // Opening failed: keep the message, drop the stream so Start works again.
             self.stream = None;
+            self.audio = None;
+        }
+    }
+
+    /// Play the card's sound while the picture runs and `on` is set.
+    fn sync_audio(&mut self, on: bool, volume: f32) {
+        let want = on && self.stream.is_some();
+        if !want {
+            self.audio = None;
+            self.audio_error = None;
+            return;
+        }
+        if self.audio.is_none() && self.audio_error.is_none() {
+            let hint = self.stream.as_ref().map(|s| s.device.name.clone()).unwrap_or_default();
+            match LiveAudio::start(&hint, volume) {
+                Ok(a) => self.audio = Some(a),
+                Err(e) => self.audio_error = Some(format!("sound: {e:#}")),
+            }
+        }
+        if let Some(a) = &self.audio {
+            a.set_volume(volume);
+        }
+    }
+
+    /// 🔊 Sound toggle, volume and level meter.
+    pub fn sound_controls(&mut self, ui: &mut egui::Ui, on: &mut bool, volume: &mut f32) {
+        if ui.checkbox(on, "🔊 Sound").on_hover_text("play the MEGA65's HDMI sound from the capture card on this computer (about 50 ms behind, like the picture)").changed() {
+            self.audio_error = None;
+        }
+        ui.add_enabled(*on, egui::Slider::new(volume, 0.0..=1.0).show_value(false)).on_hover_text("volume");
+        if let Some(a) = &self.audio {
+            let lvl = a.level().clamp(0.0, 1.0);
+            let (r, _) = ui.allocate_exact_size(egui::vec2(40.0, 8.0), egui::Sense::hover());
+            ui.painter().rect_filled(r, 2.0, ui.visuals().extreme_bg_color);
+            let mut f = r;
+            f.set_width(r.width() * lvl);
+            ui.painter().rect_filled(f, 2.0, Color32::from_rgb(90, 200, 120));
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
+        }
+        self.sync_audio(*on, *volume);
+        if let Some(e) = &self.audio_error {
+            ui.label(RichText::new(e).small().color(Color32::from_rgb(230, 90, 90)));
         }
     }
 

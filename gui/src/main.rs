@@ -3,6 +3,7 @@
 mod app;
 mod backend;
 mod keys;
+mod live_audio;
 mod live_view;
 
 fn main() -> eframe::Result {
@@ -38,6 +39,10 @@ fn main() -> eframe::Result {
             Ok(f) => println!("wrote {out} ({}x{})", f.width, f.height),
             Err(e) => println!("FAIL: {e:#}"),
         }
+        return Ok(());
+    }
+    if args.get(1).map(|a| a == "--selftest-sound").unwrap_or(false) {
+        selftest_sound(args.get(2).cloned().unwrap_or_default(), args.get(3).and_then(|v| v.parse().ok()).unwrap_or(0.0));
         return Ok(());
     }
     if args.get(1).map(|a| a == "--selftest-live").unwrap_or(false) {
@@ -462,4 +467,24 @@ fn selftest_live(device: Option<String>, out: String) {
         },
         None => println!("FAIL: no frame"),
     }
+}
+
+/// `m65-studio --selftest-sound [NAME] [VOLUME]`: play the capture card's
+/// sound for eight seconds (volume 0 by default, so it stays quiet) and print
+/// the input level twice a second. Run it from the app bundle on macOS so the
+/// microphone permission is Studio's.
+fn selftest_sound(hint: String, volume: f32) {
+    let hint = if hint.is_empty() { "UGREEN".to_string() } else { hint };
+    let a = match live_audio::LiveAudio::start(&hint, volume) {
+        Ok(a) => a,
+        Err(e) => return println!("FAIL: {e:#}"),
+    };
+    let mut peak = 0f32;
+    for i in 0..16 {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let l = a.level();
+        peak = peak.max(l);
+        println!("{:4.1} s  level {:.6}", (i + 1) as f32 / 2.0, l);
+    }
+    println!("{}: peak level {peak:.6}", if peak > 0.0 { "OK" } else { "SILENT" });
 }

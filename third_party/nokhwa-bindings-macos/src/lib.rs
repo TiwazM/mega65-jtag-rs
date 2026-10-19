@@ -1,3 +1,5 @@
+// mega65-jtag-rs: third-party code, kept as published apart from the marked patch.
+#![allow(warnings)]
 /*
 * Copyright 2022 l1npengtul <l1npengtul@protonmail.com> / The Nokhwa Contributors
 *

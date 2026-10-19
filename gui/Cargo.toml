@@ -17,3 +17,5 @@ egui = "0.29"
 rfd = "0.15"
 serde = { version = "1", features = ["derive"] }
 png = "0.17"
+cpal = "0.15"  # HDMI live sound from the capture card
+anyhow = "1"

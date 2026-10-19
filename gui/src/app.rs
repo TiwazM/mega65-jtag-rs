@@ -68,6 +68,9 @@ struct Settings {
     hdmi_device: String,
     /// Screen tab: squeeze the HDMI picture to 4:3 (off: as the card sends it).
     hdmi_4_3: bool,
+    /// Screen tab: play the capture card's sound, at this volume (0..1).
+    hdmi_sound: bool,
+    hdmi_volume: f32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -153,6 +156,8 @@ impl Default for Settings {
             screen_source: ScreenSource::Jtag,
             hdmi_device: String::new(),
             hdmi_4_3: false,
+            hdmi_sound: false,
+            hdmi_volume: 0.8,
         }
     }
 }
@@ -1060,6 +1065,8 @@ impl StudioApp {
             }
             if hdmi {
                 ui.separator();
+                self.live_view.sound_controls(ui, &mut self.s.hdmi_sound, &mut self.s.hdmi_volume);
+                ui.separator();
                 self.live_view.note_ui(ui);
             }
         });
@@ -1197,7 +1204,7 @@ impl StudioApp {
             let max = 62.0f32;
             for (i, y) in [0.0f32, 30.0, 60.0].iter().enumerate() {
                 let yy = rect.bottom() - y / max * rect.height();
-                p.line_segment([egui::pos2(rect.left(), yy), egui::pos2(rect.right(), yy)], egui::Stroke::new(0.5, ui.visuals().weak_text_color()));
+                p.line_segment([egui::pos2(rect.left(), yy), egui::pos2(rect.right(), yy)], egui::Stroke::new(0.5_f32, ui.visuals().weak_text_color()));
                 if i > 0 {
                     p.text(egui::pos2(rect.left() + 2.0, yy), egui::Align2::LEFT_BOTTOM, format!("{y:.0}"), egui::FontId::proportional(10.0), ui.visuals().weak_text_color());
                 }

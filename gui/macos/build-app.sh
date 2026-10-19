@@ -30,6 +30,7 @@ cat > "$OUT/Contents/Info.plist" <<EOF
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>LSMinimumSystemVersion</key><string>11.0</string>
   <key>NSHighResolutionCapable</key><true/>
+  <key>NSMicrophoneUsageDescription</key><string>MEGA65 Studio plays the MEGA65's HDMI sound from the USB capture card, which the Mac sees as a microphone.</string>
   <key>NSCameraUsageDescription</key><string>MEGA65 Studio shows the MEGA65's HDMI picture from a USB capture card, which the Mac sees as a camera.</string>
   <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
   <key>CFBundleDocumentTypes</key>

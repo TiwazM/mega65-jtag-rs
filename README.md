@@ -188,6 +188,8 @@ builds the same on macOS, Windows and Linux):
   live (the MEGA65's HDMI output through a USB capture card, which the
   computer sees as a camera: pick the card, Start, Snapshot… saves a PNG,
   Scanlines switches the MEGA65's own CRT emulation when connected,
+  🔊 Sound plays the card's audio input on this computer with a volume
+  slider and level meter, about 50 ms behind like the picture,
   as the card sends it, or squeezed to 4:3 with that box; it needs no serial connection
   and costs the MEGA65 nothing), JTAG screen capture (optionally on every poll, save as PNG; with
   ⌨ Send keys on, clicking the screen makes the PC keyboard the MEGA65's:
@@ -243,7 +245,8 @@ few seconds and reports its format and frame rate (on macOS run it from the app
 bundle, `open -n -W --stdout F -a "MEGA65 Studio" --args --selftest-live`, so
 the camera permission is Studio's). `m65-studio --live-grab OUT.png [NAME]`
 saves one HDMI frame the same way (about 0.7 s), for scripts and agents whose
-shell has no camera permission of its own. `m65-studio --selftest DEVICE` exercises that worker without a window, and
+shell has no camera permission of its own. `m65-studio --selftest-sound [NAME] [VOLUME]` plays the card's sound for
+eight seconds (silently by default) and prints its level. `m65-studio --selftest DEVICE` exercises that worker without a window, and
 `m65-studio --selftest-basic DEVICE FILE.bas` sends a BASIC file through it.
 
 ### macOS app bundle
@@ -251,8 +254,9 @@ shell has no camera permission of its own. `m65-studio --selftest DEVICE` exerci
 `gui/macos/build-app.sh --install` builds "MEGA65 Studio.app" (icon, Info.plist,
 ad-hoc signed) into `target/macos/` and copies it to `~/Applications`, so it can
 be launched from Spotlight or Launchpad and kept in the Dock. Its Info.plist
-carries a camera-usage text, so macOS asks once before HDMI live opens the
-capture card (an ad-hoc signed rebuild may ask again). It needs only the
+carries camera and microphone usage texts, so macOS asks once before HDMI
+live opens the capture card's picture and sound. Its signature names only the
+bundle id, so those permissions survive a rebuild. It needs only the
 system `sips`, `iconutil` and `codesign`.
 
 ### Xemu as a backend
