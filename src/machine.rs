@@ -277,6 +277,18 @@ impl Machine {
         Ok(())
     }
 
+    /// The VIC-IV's CRT scanline emulation ($D054 bit 5, PALEMU), as on HDMI/VGA.
+    pub fn scanlines(&mut self) -> Result<bool> {
+        Ok(self.mon.peek(VIC_BASE + 0x54)? & 0x20 != 0)
+    }
+
+    /// Switch the CRT scanline emulation on or off. Lasts until a reset (which
+    /// restores the configured setting) or a program rewrites $D054.
+    pub fn set_scanlines(&mut self, on: bool) -> Result<()> {
+        let v = self.mon.peek(VIC_BASE + 0x54)?;
+        self.mon.set_bytes(VIC_BASE + 0x54, &[if on { v | 0x20 } else { v & !0x20 }])
+    }
+
     /// Hold exactly these matrix keys down (scan codes; at most three), releasing any
     /// others, until the next call. `prev` is what the last call held: a newly pressed
     /// shift is written on its own first, as the scanner needs.

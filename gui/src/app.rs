@@ -252,6 +252,8 @@ pub struct StudioApp {
     keys_focused: bool,
     keys: crate::keys::KeyState,
     live_view: crate::live_view::LiveView,
+    /// The MEGA65's own CRT scanline emulation, when known.
+    mega_scanlines: Option<bool>,
     log: VecDeque<String>,
     console_in: String,
     break_in: String,
@@ -334,6 +336,7 @@ impl StudioApp {
             keys_focused: false,
             keys: Default::default(),
             live_view: Default::default(),
+            mega_scanlines: None,
             log: VecDeque::new(),
             console_in: String::new(),
             break_in: String::new(),
@@ -436,9 +439,12 @@ impl StudioApp {
                     self.last_error = None;
                     self.send_views();
                     self.send_watches();
+                    self.backend.send(Cmd::Scanlines(None));
                 }
+                Event::Scanlines(on) => self.mega_scanlines = Some(on),
                 Event::Disconnected => {
                     self.connected = false;
+                    self.mega_scanlines = None;
                     self.prof_on = false;
                     self.sd.busy = false;
                     self.sd.listed = None;
@@ -1010,6 +1016,14 @@ impl StudioApp {
             ui.separator();
             if hdmi {
                 self.live_view.controls(ui, &ctx, &mut self.s.hdmi_device);
+                let mut sl = self.mega_scanlines.unwrap_or(false);
+                if ui
+                    .add_enabled(self.connected && self.mega_scanlines.is_some(), egui::Checkbox::new(&mut sl, "Scanlines"))
+                    .on_hover_text("the MEGA65's own CRT scanline emulation, switched over the serial cable; a reset brings back the setting from the MEGA65's configuration")
+                    .changed()
+                {
+                    self.backend.send(Cmd::Scanlines(Some(sl)));
+                }
                 ui.checkbox(&mut self.s.hdmi_4_3, "4:3").on_hover_text("squeeze the picture to 4:3, for a MEGA65 set to 4:3 output that the card stretches to widescreen; off shows it as the card sends it");
             } else {
                 if ui.add_enabled(en, egui::Button::new("Capture")).clicked() {

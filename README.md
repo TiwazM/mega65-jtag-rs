@@ -52,6 +52,7 @@ Screen and input:
 | `type TEXT [-r] [--buffer]` | type via the virtual keyboard matrix (works in games); `--buffer` stuffs the KERNAL buffer instead. `~M` RETURN, `~C` RUN/STOP, `~D ~U ~L ~R` cursors, `~H` HOME, `~T` DEL, `~1 ~3 ~5 ~7` F-keys, `~z` pause |
 | `live list` / `live grab [-o FILE.png] [-d NAME]` | the real HDMI picture from a USB capture card (UVC, e.g. UGREEN 15390), no serial port needed; `list` marks likely capture cards with `*` |
 | `go64` / `pal` / `ntsc` | mode switches |
+| `scanlines [on\|off]` | show or switch the MEGA65's CRT scanline emulation ($D054 bit 5) until the next reset |
 | `hyppo` | Hypervisor DOS/process state |
 | `vf011 IMAGE.D81` | serve a local D81 as the internal drive (restarts the MEGA65 to attach and detach it) |
 
@@ -186,6 +187,7 @@ builds the same on macOS, Windows and Linux):
   follows PC, a Screen tab whose source is either the JTAG capture or HDMI
   live (the MEGA65's HDMI output through a USB capture card, which the
   computer sees as a camera: pick the card, Start, Snapshot… saves a PNG,
+  Scanlines switches the MEGA65's own CRT emulation when connected,
   as the card sends it, or squeezed to 4:3 with that box; it needs no serial connection
   and costs the MEGA65 nothing), JTAG screen capture (optionally on every poll, save as PNG; with
   ⌨ Send keys on, clicking the screen makes the PC keyboard the MEGA65's:

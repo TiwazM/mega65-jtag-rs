@@ -263,6 +263,8 @@ enum Cmd {
     Pal,
     /// Switch video to NTSC (60Hz).
     Ntsc,
+    /// Show or switch the CRT scanline emulation (on/off) until the next reset.
+    Scanlines { state: Option<String> },
     /// Show the Hypervisor's DOS and process state.
     Hyppo,
     /// Soft-reboot the FPGA into a core slot (0-7) or flash address. Does not write flash.
@@ -1016,6 +1018,15 @@ fn run(cmd: Cmd, mut mach: Machine, syms: &mega65::symbols::SymbolTable) -> anyh
         Cmd::Go64 => mach.go64()?,
         Cmd::Pal => mach.set_video(true)?,
         Cmd::Ntsc => mach.set_video(false)?,
+        Cmd::Scanlines { state } => {
+            match state.as_deref() {
+                None => {}
+                Some("on") => mach.set_scanlines(true)?,
+                Some("off") => mach.set_scanlines(false)?,
+                Some(o) => anyhow::bail!("scanlines: say on or off, not {o}"),
+            }
+            println!("scanlines {}", if mach.scanlines()? { "on" } else { "off" });
+        }
         Cmd::Hyppo => print!("{}", mach.hyppo_status()?.text),
         Cmd::Bootslot { slot } => {
             let v = parse_num(&slot).map_err(anyhow::Error::msg)?;

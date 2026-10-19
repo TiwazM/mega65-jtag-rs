@@ -44,6 +44,9 @@ pub enum Cmd {
     /// Hold exactly these keyboard matrix keys down (scan codes, at most three)
     /// until the next `HoldKeys`; an empty list releases everything.
     HoldKeys(Vec<u8>),
+    /// The MEGA65's CRT scanline emulation: switch it (Some) or just read it
+    /// (None); answered with `Event::Scanlines`.
+    Scanlines(Option<bool>),
     Raw(String),
     Reset,
     Go64,
@@ -109,6 +112,8 @@ pub enum SdOp {
 pub enum Event {
     Connected { device: String, xemu: bool, xemu_ext: bool, versions: Option<Versions> },
     Disconnected,
+    /// The MEGA65's CRT scanline emulation is on.
+    Scanlines(bool),
     Registers { regs: Registers, stopped: bool },
     Memory { id: usize, addr: u32, data: Vec<u8> },
     Disasm { addr: u32, text: String },
@@ -498,6 +503,14 @@ impl Worker {
                 } else {
                     m.type_text(&text, ret)?;
                 }
+            }
+            Cmd::Scanlines(set) => {
+                let m = self.mach()?;
+                if let Some(on) = set {
+                    m.set_scanlines(on)?;
+                }
+                let on = m.scanlines()?;
+                self.emit(Event::Scanlines(on));
             }
             Cmd::HoldKeys(keys) => {
                 if keys == self.held_keys {
