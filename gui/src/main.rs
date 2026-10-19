@@ -29,6 +29,17 @@ fn main() -> eframe::Result {
         selftest_keys(args.get(2).cloned().unwrap_or_default());
         return Ok(());
     }
+    if args.get(1).map(|a| a == "--live-grab").unwrap_or(false) {
+        // `m65-studio --live-grab OUT.png [DEVICE]`: one HDMI frame, with the
+        // app's own camera permission (macOS ties it to the app, not the shell).
+        let out = args.get(2).cloned().unwrap_or_else(|| "mega65-hdmi.png".into());
+        let r = mega65::live::pick(args.get(3).map(|s| s.as_str())).and_then(|d| mega65::live::grab(&d, 5)).and_then(|f| f.save_png(std::path::Path::new(&out)).map(|_| f));
+        match r {
+            Ok(f) => println!("wrote {out} ({}x{})", f.width, f.height),
+            Err(e) => println!("FAIL: {e:#}"),
+        }
+        return Ok(());
+    }
     if args.get(1).map(|a| a == "--selftest-live").unwrap_or(false) {
         selftest_live(args.get(2).cloned(), args.get(3).cloned().unwrap_or_else(|| "hdmi-selftest.png".into()));
         return Ok(());

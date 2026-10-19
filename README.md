@@ -239,7 +239,9 @@ panels can't interleave commands. Settings persist between runs.
 `m65-studio --selftest-live [NAME] [OUT.png]` runs the HDMI live stream for a
 few seconds and reports its format and frame rate (on macOS run it from the app
 bundle, `open -n -W --stdout F -a "MEGA65 Studio" --args --selftest-live`, so
-the camera permission is Studio's). `m65-studio --selftest DEVICE` exercises that worker without a window, and
+the camera permission is Studio's). `m65-studio --live-grab OUT.png [NAME]`
+saves one HDMI frame the same way (about 0.7 s), for scripts and agents whose
+shell has no camera permission of its own. `m65-studio --selftest DEVICE` exercises that worker without a window, and
 `m65-studio --selftest-basic DEVICE FILE.bas` sends a BASIC file through it.
 
 ### macOS app bundle
