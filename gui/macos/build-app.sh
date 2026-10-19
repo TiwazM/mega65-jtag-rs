@@ -30,6 +30,7 @@ cat > "$OUT/Contents/Info.plist" <<EOF
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>LSMinimumSystemVersion</key><string>11.0</string>
   <key>NSHighResolutionCapable</key><true/>
+  <key>NSCameraUsageDescription</key><string>MEGA65 Studio shows the MEGA65's HDMI picture from a USB capture card, which the Mac sees as a camera.</string>
   <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
   <key>CFBundleDocumentTypes</key>
   <array>
@@ -56,8 +57,10 @@ for s in 16 32 128 256 512; do
 done
 iconutil -c icns "$ICONSET" -o "$OUT/Contents/Resources/AppIcon.icns"
 
-# Ad-hoc signature so macOS runs it without complaint on this machine.
-codesign --force --deep --sign - "$OUT" >/dev/null
+# Ad-hoc signature so macOS runs it without complaint on this machine. The
+# designated requirement names only the bundle id, so permissions such as
+# camera access (HDMI live) survive a rebuild instead of being asked again.
+codesign --force --deep --sign - -r="designated => identifier \"$BUNDLE_ID\"" "$OUT" >/dev/null
 echo "built $OUT"
 
 if [ "${1:-}" = "--install" ]; then

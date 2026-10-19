@@ -9,6 +9,11 @@ license = "GPL-3.0-or-later"
 [workspace]
 members = [".", "gui"]
 
+# nokhwa's macOS backend with a fix for picking a capture format (see
+# third_party/nokhwa-bindings-macos/src/lib.rs, "mega65-jtag-rs patch").
+[patch.crates-io]
+nokhwa-bindings-macos = { path = "third_party/nokhwa-bindings-macos" }
+
 [lib]
 name = "mega65"
 path = "src/lib.rs"
@@ -23,6 +28,7 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 crossterm = "0.28"
 libc = "0.2"
+nokhwa = { version = "0.10.11", features = ["input-native"] }  # HDMI capture cards (UVC): AVFoundation, Media Foundation, V4L2
 png = "0.17"
 rand = "0.8"
 rusb = { version = "0.9", features = ["vendored"] }  # bundled libusb, so release builds need no Homebrew/system libusb

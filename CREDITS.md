@@ -93,6 +93,8 @@ on, nearly all MIT and/or Apache-2.0; `cargo metadata` lists them all):
 | serialport | the UART connection to the MEGA65 | MPL-2.0 |
 | rusb / libusb1-sys | USB access to the FTDI chip (JTAG, latency timer) | MIT |
 | libusb (C library, built into the binaries via the `vendored` feature) | the same | LGPL-2.1-or-later |
+| nokhwa (l1npengtul and contributors) | HDMI live: capture cards through AVFoundation, Media Foundation and V4L2. Its macOS backend `nokhwa-bindings-macos` 0.2.4 is **copied** into `third_party/` with a small fix to how it picks a capture format (marked "mega65-jtag-rs patch") | Apache-2.0 |
+| mozjpeg (via nokhwa, for MJPEG frames from the card) | JPEG decoding | IJG / BSD-3-Clause / zlib |
 | png | screenshots and PNG decoding | MIT OR Apache-2.0 |
 | clap | command-line parsing | MIT OR Apache-2.0 |
 | crossterm | terminal output | MIT |

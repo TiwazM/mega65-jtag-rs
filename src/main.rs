@@ -277,6 +277,28 @@ enum Cmd {
     Basic(BasicCmd),
     /// JTAG: adapter and FPGA operations.
     Jtag(JtagArgs),
+    /// Live HDMI picture from a USB capture card (no serial port needed).
+    #[command(subcommand)]
+    Live(LiveCmd),
+}
+
+#[derive(Subcommand)]
+enum LiveCmd {
+    /// List the video inputs (capture cards first).
+    List,
+    /// Save the current HDMI picture as a PNG.
+    Grab {
+        /// PNG file to write.
+        #[arg(short, long, default_value = "mega65-hdmi.png")]
+        output: String,
+        /// Video input name (part of it is enough) or number; default: the
+        /// first that looks like a capture card.
+        #[arg(short, long)]
+        device: Option<String>,
+        /// Frames to skip first (the card can send black frames while it settles).
+        #[arg(long, default_value_t = 10)]
+        skip: usize,
+    },
 }
 
 #[derive(Args)]
@@ -494,6 +516,19 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Jtag(j) => jtag_cmd(j),
+        Cmd::Live(LiveCmd::List) => {
+            for d in mega65::live::list()? {
+                println!("{:>2}  {}{}  {}", d.index, d.name, if d.looks_like_capture_card() { " *" } else { "" }, d.description);
+            }
+            Ok(())
+        }
+        Cmd::Live(LiveCmd::Grab { output, device, skip }) => {
+            let d = mega65::live::pick(device.as_deref())?;
+            let f = mega65::live::grab(&d, *skip)?;
+            f.save_png(std::path::Path::new(output))?;
+            println!("wrote {output} ({}x{} from {})", f.width, f.height, d.name);
+            Ok(())
+        }
         Cmd::DisasmFile { file, addr, from } => {
             let bytes = std::fs::read(file)?;
             let (base, data) = match addr {
@@ -1028,7 +1063,7 @@ fn run(cmd: Cmd, mut mach: Machine, syms: &mega65::symbols::SymbolTable) -> anyh
             let mem = mach.mon.read_memory(s as u32, (e.saturating_sub(s)).max(2) as usize)?;
             list_basic(&mem, s, mixed_case)?;
         }
-        Cmd::Ports | Cmd::Sd(_) | Cmd::Basic(_) | Cmd::Jtag(_) | Cmd::DisasmFile { .. } | Cmd::DmaList { file: Some(_), .. } => unreachable!(),
+        Cmd::Ports | Cmd::Sd(_) | Cmd::Basic(_) | Cmd::Jtag(_) | Cmd::Live(_) | Cmd::DisasmFile { .. } | Cmd::DmaList { file: Some(_), .. } => unreachable!(),
     }
     Ok(())
 }

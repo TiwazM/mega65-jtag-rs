@@ -50,6 +50,7 @@ Screen and input:
 |---|---|
 | `screenshot [--png FILE] [--plain]` | text (with ANSI colours on a terminal) or pixel-accurate PNG of the VIC-IV text screen |
 | `type TEXT [-r] [--buffer]` | type via the virtual keyboard matrix (works in games); `--buffer` stuffs the KERNAL buffer instead. `~M` RETURN, `~C` RUN/STOP, `~D ~U ~L ~R` cursors, `~H` HOME, `~T` DEL, `~1 ~3 ~5 ~7` F-keys, `~z` pause |
+| `live list` / `live grab [-o FILE.png] [-d NAME]` | the real HDMI picture from a USB capture card (UVC, e.g. UGREEN 15390), no serial port needed; `list` marks likely capture cards with `*` |
 | `go64` / `pal` / `ntsc` | mode switches |
 | `hyppo` | Hypervisor DOS/process state |
 | `vf011 IMAGE.D81` | serve a local D81 as the internal drive (restarts the MEGA65 to attach and detach it) |
@@ -182,7 +183,11 @@ builds the same on macOS, Windows and Linux):
   loader (Browse or drag a file onto the window), memory save, virtual keyboard,
   GO64 / PAL / NTSC;
 - tabs: two live hex memory views (click a byte to edit it), disassembly that
-  follows PC, screen capture (optionally on every poll, save as PNG; with
+  follows PC, a Screen tab whose source is either the JTAG capture or HDMI
+  live (the MEGA65's HDMI output through a USB capture card, which the
+  computer sees as a camera: pick the card, Start, Snapshot… saves a PNG,
+  as the card sends it, or squeezed to 4:3 with that box; it needs no serial connection
+  and costs the MEGA65 nothing), JTAG screen capture (optionally on every poll, save as PNG; with
   ⌨ Send keys on, clicking the screen makes the PC keyboard the MEGA65's:
   cursor keys, RETURN, SPACE, TAB, letters, digits, F-keys and ESC = RUN/STOP
   are held down on the MEGA65 for as long as you hold them, ⌘ shortcuts stay
@@ -231,14 +236,19 @@ drives 8 and 9 hold before and after.
 
 All hardware traffic runs on one worker thread, so the UI never blocks and
 panels can't interleave commands. Settings persist between runs.
-`m65-studio --selftest DEVICE` exercises that worker without a window, and
+`m65-studio --selftest-live [NAME] [OUT.png]` runs the HDMI live stream for a
+few seconds and reports its format and frame rate (on macOS run it from the app
+bundle, `open -n -W --stdout F -a "MEGA65 Studio" --args --selftest-live`, so
+the camera permission is Studio's). `m65-studio --selftest DEVICE` exercises that worker without a window, and
 `m65-studio --selftest-basic DEVICE FILE.bas` sends a BASIC file through it.
 
 ### macOS app bundle
 
 `gui/macos/build-app.sh --install` builds "MEGA65 Studio.app" (icon, Info.plist,
 ad-hoc signed) into `target/macos/` and copies it to `~/Applications`, so it can
-be launched from Spotlight or Launchpad and kept in the Dock. It needs only the
+be launched from Spotlight or Launchpad and kept in the Dock. Its Info.plist
+carries a camera-usage text, so macOS asks once before HDMI live opens the
+capture card (an ad-hoc signed rebuild may ask again). It needs only the
 system `sips`, `iconutil` and `codesign`.
 
 ### Xemu as a backend

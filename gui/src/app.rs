@@ -62,6 +62,21 @@ struct Settings {
     sd_path: String,
     /// Drives tab: the D81 served from this computer as the internal drive.
     vf011_path: String,
+    /// Screen tab: JTAG capture or the HDMI picture from a capture card.
+    screen_source: ScreenSource,
+    /// Screen tab: the capture card's name.
+    hdmi_device: String,
+    /// Screen tab: squeeze the HDMI picture to 4:3 (off: as the card sends it).
+    hdmi_4_3: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+enum ScreenSource {
+    /// Read video memory over the serial monitor and draw it here.
+    #[default]
+    Jtag,
+    /// The real HDMI output through a USB capture card.
+    Hdmi,
 }
 
 /// How uploads lay files out on the card (see `mega65::fat32::Allocation`).
@@ -135,6 +150,9 @@ impl Default for Settings {
             sd_layout: SdLayout::Auto,
             sd_path: "/".into(),
             vf011_path: String::new(),
+            screen_source: ScreenSource::Jtag,
+            hdmi_device: String::new(),
+            hdmi_4_3: false,
         }
     }
 }
@@ -233,6 +251,7 @@ pub struct StudioApp {
     /// The screen had keyboard focus with Send keys on (last frame).
     keys_focused: bool,
     keys: crate::keys::KeyState,
+    live_view: crate::live_view::LiveView,
     log: VecDeque<String>,
     console_in: String,
     break_in: String,
@@ -314,6 +333,7 @@ impl StudioApp {
             send_keys: false,
             keys_focused: false,
             keys: Default::default(),
+            live_view: Default::default(),
             log: VecDeque::new(),
             console_in: String::new(),
             break_in: String::new(),
@@ -979,26 +999,40 @@ impl StudioApp {
     fn screen_tab(&mut self, ui: &mut egui::Ui) {
         let en = self.connected && !self.busy;
         let mut turned_on = false;
+        let ctx = ui.ctx().clone();
+        let hdmi = self.s.screen_source == ScreenSource::Hdmi;
         ui.horizontal(|ui| {
-            if ui.add_enabled(en, egui::Button::new("Capture")).clicked() {
-                self.backend.send(Cmd::Screenshot { pause: self.s.pause_for_screen });
-            }
-            if ui.checkbox(&mut self.s.live_screen, "Auto").on_hover_text("capture on every live poll (slow: ~1 s each)").changed() {
-                self.send_live();
-            }
-            ui.checkbox(&mut self.s.pause_for_screen, "Pause CPU while capturing").on_hover_text("gives a consistent frame; ignored on stock Xemu, not needed on the ai-agent build (it delivers whole frames)");
-            if ui.add_enabled(en && self.screen_tex.is_some(), egui::Button::new("Save PNG…")).clicked() {
-                if let Some(p) = rfd::FileDialog::new().set_file_name("mega65-screen.png").add_filter("PNG", &["png"]).save_file() {
-                    self.backend.send(Cmd::SavePng { path: p, pause: self.s.pause_for_screen });
+            ui.label("Source:");
+            ui.selectable_value(&mut self.s.screen_source, ScreenSource::Jtag, "JTAG capture")
+                .on_hover_text("read the MEGA65's video memory over the serial cable and draw it here (slow, but shows exact characters and colours)");
+            ui.selectable_value(&mut self.s.screen_source, ScreenSource::Hdmi, "HDMI live")
+                .on_hover_text("the real HDMI picture through a USB capture card, at full speed; costs the MEGA65 nothing");
+            ui.separator();
+            if hdmi {
+                self.live_view.controls(ui, &ctx, &mut self.s.hdmi_device);
+                ui.checkbox(&mut self.s.hdmi_4_3, "4:3").on_hover_text("squeeze the picture to 4:3, for a MEGA65 set to 4:3 output that the card stretches to widescreen; off shows it as the card sends it");
+            } else {
+                if ui.add_enabled(en, egui::Button::new("Capture")).clicked() {
+                    self.backend.send(Cmd::Screenshot { pause: self.s.pause_for_screen });
+                }
+                if ui.checkbox(&mut self.s.live_screen, "Auto").on_hover_text("capture on every live poll (slow: ~1 s each)").changed() {
+                    self.send_live();
+                }
+                ui.checkbox(&mut self.s.pause_for_screen, "Pause CPU while capturing").on_hover_text("gives a consistent frame; ignored on stock Xemu, not needed on the ai-agent build (it delivers whole frames)");
+                if ui.add_enabled(en && self.screen_tex.is_some(), egui::Button::new("Save PNG…")).clicked() {
+                    if let Some(p) = rfd::FileDialog::new().set_file_name("mega65-screen.png").add_filter("PNG", &["png"]).save_file() {
+                        self.backend.send(Cmd::SavePng { path: p, pause: self.s.pause_for_screen });
+                    }
+                }
+                if ui.add_enabled(!self.screen_text.is_empty(), egui::Button::new("Copy text")).clicked() {
+                    ui.output_mut(|o| o.copied_text = self.screen_text.clone());
                 }
             }
-            if ui.add_enabled(!self.screen_text.is_empty(), egui::Button::new("Copy text")).clicked() {
-                ui.output_mut(|o| o.copied_text = self.screen_text.clone());
-            }
-            ui.separator();
+        });
+        ui.horizontal(|ui| {
             turned_on = ui
                 .add_enabled(self.connected, egui::Checkbox::new(&mut self.send_keys, "⌨ Send keys"))
-                .on_hover_text("while the screen below has focus, keys you press (cursor keys, RETURN, SPACE, TAB, letters, F-keys, ESC = RUN/STOP) are held on the MEGA65's keyboard; ⌘ shortcuts stay with Studio. Click the screen to send keys, click anywhere else to stop.")
+                .on_hover_text("while the screen below has focus, keys you press (cursor keys, RETURN, SPACE, TAB, letters, F-keys, ESC = RUN/STOP) are held on the MEGA65's keyboard; ⌘ shortcuts stay with Studio. Click the screen to send keys, click anywhere else to stop. Needs the serial connection.")
                 .changed()
                 && self.send_keys;
             // Status sits up here (from the last frame) so the screen below
@@ -1007,17 +1041,35 @@ impl StudioApp {
                 ui.label(RichText::new("keys go to the MEGA65; click outside the screen to stop").color(Color32::from_rgb(90, 200, 120)).small());
             } else if self.send_keys && self.connected {
                 ui.label(RichText::new("click the screen to send keys").weak().small());
+            } else if !self.connected {
+                ui.label(RichText::new("connect to send keys").weak().small());
+            }
+            if hdmi {
+                ui.separator();
+                self.live_view.note_ui(ui);
             }
         });
+        if hdmi {
+            self.live_view.poll(&ctx);
+        } else if self.live_view.running() {
+            self.live_view.stop();
+        }
         let avail = ui.available_size();
-        let resp = if let Some(t) = &self.screen_tex {
+        let (tex, aspect) = if hdmi {
+            (self.live_view.texture(), if self.s.hdmi_4_3 { Some(4.0 / 3.0) } else { None })
+        } else {
+            (self.screen_tex.as_ref(), None)
+        };
+        let resp = if let Some(t) = tex {
             let (w, h) = (t.size()[0] as f32, t.size()[1] as f32);
+            let w = aspect.map_or(w, |a| h * a);
             let scale = (avail.x / w).min(avail.y / h).max(0.1);
             ui.add(egui::Image::new((t.id(), egui::vec2(w * scale, h * scale))).sense(egui::Sense::click()))
         } else {
             let size = if self.send_keys { egui::vec2(avail.x, avail.y.min(200.0)) } else { egui::vec2(avail.x, 20.0) };
             let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
-            ui.painter().text(rect.left_top(), egui::Align2::LEFT_TOP, "no capture yet", egui::FontId::proportional(14.0), ui.visuals().weak_text_color());
+            let msg = if hdmi { "no HDMI picture yet: pick the capture card and press Start" } else { "no capture yet" };
+            ui.painter().text(rect.left_top(), egui::Align2::LEFT_TOP, msg, egui::FontId::proportional(14.0), ui.visuals().weak_text_color());
             resp
         };
         let capturing = self.send_keys && self.connected && resp.has_focus();

@@ -3,6 +3,7 @@
 mod app;
 mod backend;
 mod keys;
+mod live_view;
 
 fn main() -> eframe::Result {
     // `m65-studio --selftest DEVICE` drives the worker thread without a window
@@ -26,6 +27,10 @@ fn main() -> eframe::Result {
     }
     if args.get(1).map(|a| a == "--selftest-keys").unwrap_or(false) {
         selftest_keys(args.get(2).cloned().unwrap_or_default());
+        return Ok(());
+    }
+    if args.get(1).map(|a| a == "--selftest-live").unwrap_or(false) {
+        selftest_live(args.get(2).cloned(), args.get(3).cloned().unwrap_or_else(|| "hdmi-selftest.png".into()));
         return Ok(());
     }
     if args.get(1).map(|a| a == "--selftest").unwrap_or(false) {
@@ -402,4 +407,48 @@ fn selftest_mount(device: String, path: String) {
     }
     println!("{}", if ops_left > 0 { "SELFTEST TIMED OUT" } else if failed { "MOUNT SELFTEST FAILED" } else { "MOUNT SELFTEST PASSED" });
     b.send(Cmd::Disconnect);
+}
+
+/// `m65-studio --selftest-live [DEVICE] [OUT.png]`: run the HDMI live stream
+/// for five seconds as the Screen tab does, print the format and frame rate,
+/// and save the last frame. Run it from the app bundle on macOS so the camera
+/// permission belongs to Studio: `open -W --stdout F -a "MEGA65 Studio" --args ...`.
+fn selftest_live(device: Option<String>, out: String) {
+    use std::time::{Duration, Instant};
+    let dev = match mega65::live::pick(device.as_deref()) {
+        Ok(d) => d,
+        Err(e) => return println!("FAIL: {e:#}"),
+    };
+    println!("device: {} ({})", dev.name, dev.description);
+    let s = mega65::live::LiveStream::start(dev, || {});
+    let start = Instant::now();
+    let (mut frames, mut seen) = (0u32, None);
+    // Up to two minutes for the first frame (the permission prompt waits
+    // for a click), then five seconds of frames.
+    let mut until = Duration::from_secs(120);
+    while start.elapsed() < until {
+        if let Some(f) = s.newer_than(seen) {
+            if seen.is_none() {
+                println!("first frame after {:?}", start.elapsed());
+                until = start.elapsed() + Duration::from_secs(5);
+            }
+            seen = Some(f.seq);
+            frames += 1;
+        }
+        if s.finished() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    println!("format: {}  fps: {:.1}  frames seen: {frames}", s.format(), s.fps());
+    if let Some(e) = s.error() {
+        println!("error: {e}");
+    }
+    match s.latest() {
+        Some(f) => match f.save_png(std::path::Path::new(&out)) {
+            Ok(()) => println!("OK: saved {out} ({}x{})", f.width, f.height),
+            Err(e) => println!("FAIL: {e:#}"),
+        },
+        None => println!("FAIL: no frame"),
+    }
 }
