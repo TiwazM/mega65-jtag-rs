@@ -1,5 +1,0 @@
-{
-  "presented_fps": 15.011280078341645,
-  "seconds": 6.1287245005,
-  "backbank_sampler_output": "t=   1s  29 changes/s\nt=   2s  30 changes/s\nt=   3s  29 changes/s\nt=   4s  30 changes/s\nt=   5s  30 changes/s\n$00074BA: 4356 samples (726/s), 178 changes (29.7/s), 2 distinct values\n"
-}
