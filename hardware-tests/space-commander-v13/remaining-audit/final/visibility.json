@@ -1,0 +1,49 @@
+{
+  "passed": true,
+  "scp_sha256": "512606b0c92edd2c63f0795961aa18a2dbff768298de939316b9b53e95dfc5c9",
+  "checks": [
+    {
+      "scene": "mule-close",
+      "visible": [
+        1,
+        1
+      ]
+    },
+    {
+      "scene": "raider",
+      "visible": [
+        1,
+        1
+      ]
+    },
+    {
+      "scene": "manta",
+      "visible": [
+        1,
+        1
+      ]
+    },
+    {
+      "scene": "razorwing",
+      "visible": [
+        1,
+        1
+      ]
+    },
+    {
+      "scene": "carrier-close",
+      "visible": [
+        1,
+        1
+      ]
+    },
+    {
+      "scene": "carrier-far",
+      "visible": [
+        1,
+        1
+      ]
+    }
+  ],
+  "code_restored": true
+}

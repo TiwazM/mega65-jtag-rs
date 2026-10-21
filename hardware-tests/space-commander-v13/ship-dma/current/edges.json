@@ -1,0 +1,38 @@
+{
+  "scp_sha256": "941f3a3adebcc9bf64188e2210db9c73d85e13edc4dc1098d4d6df1126c1fd25",
+  "checks": [
+    {
+      "scene": "unaligned",
+      "visible": [
+        1,
+        1
+      ]
+    },
+    {
+      "scene": "right-frame",
+      "visible": [
+        1,
+        1
+      ]
+    },
+    {
+      "scene": "upper-monitor",
+      "visible": [
+        0,
+        0
+      ]
+    },
+    {
+      "scene": "hull-hit",
+      "visible": [
+        1,
+        1
+      ]
+    }
+  ],
+  "sector_palette_preserved": true,
+  "restored": {
+    "rendered_delta": 47,
+    "presented_delta": 46
+  }
+}

@@ -1,0 +1,82 @@
+{
+  "passed": true,
+  "scp_sha256": "c81999811c51c0ebaf95afe3bb1f7d2d57b389adf60dc039a1d873dd312fe17f",
+  "checks": [
+    {
+      "scene": "combat-no-target",
+      "left": null,
+      "selected": 255,
+      "checked": [
+        "source",
+        0,
+        1,
+        2
+      ],
+      "changed_pixels": 0
+    },
+    {
+      "scene": "combat-to-mines",
+      "left": 12,
+      "selected": 0,
+      "checked": [
+        "source",
+        0,
+        1,
+        2
+      ],
+      "changed_pixels": 0
+    },
+    {
+      "scene": "last-mine-alive",
+      "left": 1,
+      "selected": 0,
+      "checked": [
+        "source",
+        0,
+        1,
+        2
+      ],
+      "changed_pixels": 0
+    },
+    {
+      "scene": "last-laser-mine-exploding",
+      "left": 0,
+      "selected": 255,
+      "checked": [
+        "source",
+        0,
+        1,
+        2
+      ],
+      "changed_pixels": 0
+    },
+    {
+      "scene": "last-proximity-mine-exploding",
+      "left": 0,
+      "selected": 255,
+      "checked": [
+        "source",
+        0,
+        1,
+        2
+      ],
+      "changed_pixels": 0
+    },
+    {
+      "scene": "trap-cleared",
+      "left": null,
+      "selected": 255,
+      "checked": [
+        "source",
+        0,
+        1,
+        2
+      ],
+      "changed_pixels": 0
+    }
+  ],
+  "code_verified": true,
+  "simulation_restored": true,
+  "rendered_delta": 15,
+  "presented_delta": 15
+}

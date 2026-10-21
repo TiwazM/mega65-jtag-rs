@@ -1,0 +1,451 @@
+{
+  "scp_sha256": "ab934761d56cebb1800a9d1afb4b27f30a53319ceb2b30002bff5ea2d195af4e",
+  "fixed_scene": true,
+  "rows": [
+    {
+      "label": "Carrier broadside 1500 m",
+      "seconds": 6.259687396,
+      "presented_fps": 23.164096036593836,
+      "rendered_fps": 23.00434365013457,
+      "video_hz": 59.90714492222544,
+      "median_draw_ms": 42.5,
+      "draw_ms_range": [
+        41.5,
+        43.0
+      ],
+      "median_hud_fps": 23,
+      "rows": [
+        {
+          "t": 12.0044433745,
+          "read_seconds": 0.08170158299999919,
+          "presented": 1380,
+          "replaced": 433,
+          "video": 2705,
+          "rendered": 1816,
+          "draw_ms": 42.75,
+          "loop_ms": 42.75,
+          "hud_fps": 23,
+          "hud_frame_ms": 42
+        },
+        {
+          "t": 12.526022853499999,
+          "read_seconds": 0.0914868749999993,
+          "presented": 1393,
+          "replaced": 433,
+          "video": 2737,
+          "rendered": 1828,
+          "draw_ms": 41.5,
+          "loop_ms": 41.75,
+          "hud_fps": 23,
+          "hud_frame_ms": 43
+        },
+        {
+          "t": 13.050240625,
+          "read_seconds": 0.08787199999999906,
+          "presented": 1405,
+          "replaced": 433,
+          "video": 2768,
+          "rendered": 1840,
+          "draw_ms": 41.5,
+          "loop_ms": 41.5,
+          "hud_fps": 23,
+          "hud_frame_ms": 43
+        },
+        {
+          "t": 13.570699166499999,
+          "read_seconds": 0.08534383300000137,
+          "presented": 1417,
+          "replaced": 433,
+          "video": 2799,
+          "rendered": 1852,
+          "draw_ms": 41.75,
+          "loop_ms": 41.75,
+          "hud_fps": 23,
+          "hud_frame_ms": 43
+        },
+        {
+          "t": 14.0919217705,
+          "read_seconds": 0.086128540999999,
+          "presented": 1428,
+          "replaced": 433,
+          "video": 2830,
+          "rendered": 1864,
+          "draw_ms": 42.75,
+          "loop_ms": 43.0,
+          "hud_fps": 23,
+          "hud_frame_ms": 43
+        },
+        {
+          "t": 14.6115863955,
+          "read_seconds": 0.0841260410000011,
+          "presented": 1440,
+          "replaced": 433,
+          "video": 2861,
+          "rendered": 1876,
+          "draw_ms": 42.75,
+          "loop_ms": 42.75,
+          "hud_fps": 23,
+          "hud_frame_ms": 42
+        },
+        {
+          "t": 15.1323608125,
+          "read_seconds": 0.08369837500000088,
+          "presented": 1453,
+          "replaced": 433,
+          "video": 2892,
+          "rendered": 1888,
+          "draw_ms": 43.0,
+          "loop_ms": 43.0,
+          "hud_fps": 23,
+          "hud_frame_ms": 42
+        },
+        {
+          "t": 15.6502513745,
+          "read_seconds": 0.08705608300000023,
+          "presented": 1465,
+          "replaced": 433,
+          "video": 2923,
+          "rendered": 1900,
+          "draw_ms": 42.5,
+          "loop_ms": 42.5,
+          "hud_fps": 23,
+          "hud_frame_ms": 42
+        },
+        {
+          "t": 16.171841249499998,
+          "read_seconds": 0.08665358299999681,
+          "presented": 1477,
+          "replaced": 433,
+          "video": 2954,
+          "rendered": 1912,
+          "draw_ms": 42.5,
+          "loop_ms": 42.5,
+          "hud_fps": 23,
+          "hud_frame_ms": 42
+        },
+        {
+          "t": 16.6944319165,
+          "read_seconds": 0.08704358299999981,
+          "presented": 1489,
+          "replaced": 433,
+          "video": 2986,
+          "rendered": 1924,
+          "draw_ms": 42.25,
+          "loop_ms": 42.5,
+          "hud_fps": 23,
+          "hud_frame_ms": 42
+        },
+        {
+          "t": 17.214369708,
+          "read_seconds": 0.08116491599999875,
+          "presented": 1501,
+          "replaced": 433,
+          "video": 3017,
+          "rendered": 1936,
+          "draw_ms": 42.5,
+          "loop_ms": 42.5,
+          "hud_fps": 23,
+          "hud_frame_ms": 42
+        },
+        {
+          "t": 17.740223770500002,
+          "read_seconds": 0.0900952910000008,
+          "presented": 1513,
+          "replaced": 433,
+          "video": 3048,
+          "rendered": 1948,
+          "draw_ms": 42.5,
+          "loop_ms": 42.5,
+          "hud_fps": 23,
+          "hud_frame_ms": 43
+        },
+        {
+          "t": 18.2641307705,
+          "read_seconds": 0.08746104099999741,
+          "presented": 1525,
+          "replaced": 433,
+          "video": 3080,
+          "rendered": 1960,
+          "draw_ms": 42.75,
+          "loop_ms": 42.75,
+          "hud_fps": 23,
+          "hud_frame_ms": 43
+        }
+      ]
+    }
+  ],
+  "motion": [
+    {
+      "position": [
+        300,
+        180,
+        1504
+      ],
+      "camera": [
+        37,
+        22,
+        188
+      ],
+      "screen": [
+        31,
+        19
+      ]
+    },
+    {
+      "position": [
+        300,
+        180,
+        1503
+      ],
+      "camera": [
+        37,
+        22,
+        187
+      ],
+      "screen": [
+        31,
+        19
+      ]
+    },
+    {
+      "position": [
+        300,
+        180,
+        1502
+      ],
+      "camera": [
+        37,
+        22,
+        187
+      ],
+      "screen": [
+        31,
+        19
+      ]
+    },
+    {
+      "position": [
+        300,
+        180,
+        1501
+      ],
+      "camera": [
+        37,
+        22,
+        187
+      ],
+      "screen": [
+        31,
+        19
+      ]
+    },
+    {
+      "position": [
+        300,
+        180,
+        1500
+      ],
+      "camera": [
+        37,
+        22,
+        187
+      ],
+      "screen": [
+        32,
+        19
+      ]
+    },
+    {
+      "position": [
+        300,
+        180,
+        1499
+      ],
+      "camera": [
+        37,
+        22,
+        187
+      ],
+      "screen": [
+        32,
+        19
+      ]
+    },
+    {
+      "position": [
+        300,
+        180,
+        1498
+      ],
+      "camera": [
+        37,
+        22,
+        187
+      ],
+      "screen": [
+        32,
+        19
+      ]
+    },
+    {
+      "position": [
+        300,
+        180,
+        1497
+      ],
+      "camera": [
+        37,
+        22,
+        187
+      ],
+      "screen": [
+        32,
+        19
+      ]
+    },
+    {
+      "position": [
+        300,
+        180,
+        1496
+      ],
+      "camera": [
+        37,
+        22,
+        187
+      ],
+      "screen": [
+        32,
+        19
+      ]
+    },
+    {
+      "position": [
+        300,
+        180,
+        1495
+      ],
+      "camera": [
+        37,
+        22,
+        186
+      ],
+      "screen": [
+        32,
+        19
+      ]
+    },
+    {
+      "position": [
+        300,
+        180,
+        1494
+      ],
+      "camera": [
+        37,
+        22,
+        186
+      ],
+      "screen": [
+        32,
+        19
+      ]
+    },
+    {
+      "position": [
+        300,
+        180,
+        1493
+      ],
+      "camera": [
+        37,
+        22,
+        186
+      ],
+      "screen": [
+        32,
+        19
+      ]
+    },
+    {
+      "position": [
+        300,
+        180,
+        1492
+      ],
+      "camera": [
+        37,
+        22,
+        186
+      ],
+      "screen": [
+        32,
+        19
+      ]
+    },
+    {
+      "position": [
+        300,
+        180,
+        1491
+      ],
+      "camera": [
+        37,
+        22,
+        186
+      ],
+      "screen": [
+        32,
+        19
+      ]
+    },
+    {
+      "position": [
+        300,
+        180,
+        1490
+      ],
+      "camera": [
+        37,
+        22,
+        186
+      ],
+      "screen": [
+        32,
+        19
+      ]
+    },
+    {
+      "position": [
+        300,
+        180,
+        1489
+      ],
+      "camera": [
+        37,
+        22,
+        186
+      ],
+      "screen": [
+        32,
+        19
+      ]
+    },
+    {
+      "position": [
+        300,
+        180,
+        1488
+      ],
+      "camera": [
+        37,
+        22,
+        186
+      ],
+      "screen": [
+        32,
+        19
+      ]
+    }
+  ]
+}
