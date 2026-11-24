@@ -301,6 +301,29 @@ enum LiveCmd {
         #[arg(long, default_value_t = 10)]
         skip: usize,
     },
+    /// Record the HDMI sound from the capture card to a WAV file (stereo,
+    /// at the card's rate). Ctrl-C stops early; the file stays valid. On
+    /// macOS a shell without microphone permission hangs or records silence: use
+    /// `m65-studio --record-audio` from the app bundle instead.
+    Record {
+        /// WAV file to write.
+        #[arg(short, long, default_value = "mega65-hdmi.wav")]
+        output: String,
+        /// Seconds to record (default: until Ctrl-C).
+        #[arg(short, long)]
+        seconds: Option<f64>,
+        /// Sound input name (part of it is enough); default: the first that
+        /// looks like a capture card.
+        #[arg(short, long)]
+        device: Option<String>,
+        /// Write 32-bit float samples instead of 16-bit PCM.
+        #[arg(long)]
+        float: bool,
+        /// Start the file at the first sample at least this loud (0..1, e.g.
+        /// 0.001), so it lines up with the start of the sound.
+        #[arg(long, value_name = "LEVEL")]
+        wait: Option<f32>,
+    },
 }
 
 #[derive(Args)]
@@ -522,6 +545,10 @@ fn main() -> anyhow::Result<()> {
             for d in mega65::live::list()? {
                 println!("{:>2}  {}{}  {}", d.index, d.name, if d.looks_like_capture_card() { " *" } else { "" }, d.description);
             }
+            match mega65::live_audio::device_names() {
+                Ok(n) => println!("audio devices: {}", n.join(", ")),
+                Err(e) => println!("audio devices: {e:#}"),
+            }
             Ok(())
         }
         Cmd::Live(LiveCmd::Grab { output, device, skip }) => {
@@ -529,6 +556,28 @@ fn main() -> anyhow::Result<()> {
             let f = mega65::live::grab(&d, *skip)?;
             f.save_png(std::path::Path::new(output))?;
             println!("wrote {output} ({}x{} from {})", f.width, f.height, d.name);
+            Ok(())
+        }
+        Cmd::Live(LiveCmd::Record { output, seconds, device, float, wait }) => {
+            use mega65::live_audio::{AudioRecorder, RecordOptions, WavFormat};
+            let opts = RecordOptions {
+                hint: device.clone().unwrap_or_default(),
+                format: if *float { WavFormat::Float32 } else { WavFormat::Pcm16 },
+                max_seconds: *seconds,
+                wait_for_sound: *wait,
+            };
+            let r = AudioRecorder::start(output, &opts)?;
+            eprintln!("recording {} Hz stereo from {} to {output}{}", r.rate, r.device, if seconds.is_none() { " (Ctrl-C stops)" } else { "" });
+            let mut waited = false;
+            while !r.finished() {
+                if r.waiting() && !waited {
+                    eprintln!("waiting for sound…");
+                    waited = true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            let s = r.stop()?;
+            println!("wrote {output}: {:.2} s, {} frames at {} Hz, peak {:.4}{}", s.seconds(), s.frames, s.rate, s.peak, if s.peak == 0.0 { " (SILENT)" } else { "" });
             Ok(())
         }
         Cmd::DisasmFile { file, addr, from } => {

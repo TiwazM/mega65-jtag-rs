@@ -45,6 +45,10 @@ fn main() -> eframe::Result {
         selftest_sound(args.get(2).cloned().unwrap_or_default(), args.get(3).and_then(|v| v.parse().ok()).unwrap_or(0.0));
         return Ok(());
     }
+    if args.get(1).map(|a| a == "--record-audio").unwrap_or(false) {
+        record_audio(&args[2..]);
+        return Ok(());
+    }
     if args.get(1).map(|a| a == "--selftest-live").unwrap_or(false) {
         selftest_live(args.get(2).cloned(), args.get(3).cloned().unwrap_or_else(|| "hdmi-selftest.png".into()));
         return Ok(());
@@ -466,6 +470,43 @@ fn selftest_live(device: Option<String>, out: String) {
             Err(e) => println!("FAIL: {e:#}"),
         },
         None => println!("FAIL: no frame"),
+    }
+}
+
+/// `m65-studio --record-audio OUT.wav SECONDS [--device NAME] [--float]
+/// [--wait LEVEL]`: record the capture card's sound to a WAV file, like
+/// `m65rs live record`. On macOS run it from the app bundle so the microphone
+/// permission is Studio's (a shell without it hangs or records silence):
+/// `open -n -W --stdout F -a "MEGA65 Studio" --args --record-audio /tmp/x.wav 5`.
+fn record_audio(args: &[String]) {
+    use mega65::live_audio::{AudioRecorder, RecordOptions, WavFormat};
+    let mut out = "mega65-hdmi.wav".to_string();
+    let mut opts = RecordOptions { max_seconds: Some(5.0), ..Default::default() };
+    let mut pos = 0;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--device" => opts.hint = it.next().cloned().unwrap_or_default(),
+            "--float" => opts.format = WavFormat::Float32,
+            "--wait" => opts.wait_for_sound = it.next().and_then(|v| v.parse().ok()),
+            _ if pos == 0 => (out, pos) = (a.clone(), 1),
+            _ => opts.max_seconds = a.parse().ok(),
+        }
+    }
+    let r = match AudioRecorder::start(&out, &opts) {
+        Ok(r) => r,
+        Err(e) => return println!("FAIL: {e:#}"),
+    };
+    println!("recording {} Hz stereo from {} to {out}", r.rate, r.device);
+    // A wait for sound can take a while; give up after the length plus a minute.
+    let limit = std::time::Duration::from_secs_f64(opts.max_seconds.unwrap_or(5.0) + 60.0);
+    let start = std::time::Instant::now();
+    while !r.finished() && start.elapsed() < limit {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    match r.stop() {
+        Ok(s) => println!("{}: wrote {out}: {:.2} s, {} frames at {} Hz, peak {:.4}", if s.peak > 0.0 { "OK" } else { "SILENT" }, s.seconds(), s.frames, s.rate, s.peak),
+        Err(e) => println!("FAIL: {e:#}"),
     }
 }
 

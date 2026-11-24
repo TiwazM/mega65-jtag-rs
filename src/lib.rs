@@ -18,6 +18,7 @@ pub mod dma;
 pub mod fat32;
 pub mod jtag;
 pub mod live;
+pub mod live_audio;
 pub mod machine;
 pub mod memsearch;
 pub mod monitor;

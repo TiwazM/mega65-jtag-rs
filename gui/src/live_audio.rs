@@ -30,23 +30,7 @@ pub struct LiveAudio {
     volume: Arc<AtomicU32>,
 }
 
-/// Input devices whose name contains `hint` (case-insensitive) come first.
-pub fn find_input(hint: &str) -> anyhow::Result<cpal::Device> {
-    let host = cpal::default_host();
-    let hint = hint.to_ascii_lowercase();
-    let words = ["ugreen", "capture", "hdmi", "macrosilicon", "cam link", "elgato", "usb video"];
-    let mut fallback = None;
-    for d in host.input_devices()? {
-        let n = d.name().unwrap_or_default().to_ascii_lowercase();
-        if !hint.is_empty() && n.contains(&hint) {
-            return Ok(d);
-        }
-        if fallback.is_none() && words.iter().any(|w| n.contains(w)) {
-            fallback = Some(d);
-        }
-    }
-    fallback.ok_or_else(|| anyhow::anyhow!("the capture card has no sound input on this computer"))
-}
+pub use mega65::live_audio::find_input;
 
 impl LiveAudio {
     /// Start playing the input whose name contains `hint` (the video device's

@@ -25,6 +25,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+cpal = "0.15"  # HDMI live sound from the capture card (live record)
 clap = { version = "4.5", features = ["derive", "env"] }
 crossterm = "0.28"
 libc = "0.2"

@@ -2127,6 +2127,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "cpal",
  "crossterm",
  "libc",
  "nokhwa",

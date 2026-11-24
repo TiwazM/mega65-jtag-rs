@@ -3,6 +3,7 @@
 
 use egui::{Color32, RichText, TextureHandle, TextureOptions};
 use mega65::live::{self, LiveDevice, LiveStream};
+use mega65::live_audio::{AudioRecorder, RecordOptions};
 
 use crate::live_audio::LiveAudio;
 
@@ -11,6 +12,8 @@ pub struct LiveView {
     stream: Option<LiveStream>,
     audio: Option<LiveAudio>,
     audio_error: Option<String>,
+    recorder: Option<AudioRecorder>,
+    rec_note: Option<(String, bool)>,
     tex: Option<TextureHandle>,
     seen: Option<u64>,
     devices: Option<Result<Vec<LiveDevice>, String>>,
@@ -59,6 +62,27 @@ impl LiveView {
         self.stream = None;
         self.audio = None;
         self.note = None;
+        self.stop_recording();
+    }
+
+    fn start_recording(&mut self) {
+        let Some(p) = rfd::FileDialog::new().set_file_name("mega65-hdmi.wav").add_filter("WAV", &["wav"]).save_file() else { return };
+        let hint = self.stream.as_ref().map(|s| s.device.name.clone()).unwrap_or_default();
+        match AudioRecorder::start(p, &RecordOptions { hint, ..Default::default() }) {
+            Ok(r) => self.recorder = Some(r),
+            Err(e) => self.rec_note = Some((format!("could not record: {e:#}"), true)),
+        }
+    }
+
+    fn stop_recording(&mut self) {
+        let Some(r) = self.recorder.take() else { return };
+        self.rec_note = Some(match r.stop() {
+            Ok(s) => (
+                format!("saved {} ({:.1} s, {} Hz stereo{})", s.path.display(), s.seconds(), s.rate, if s.peak == 0.0 { ", silent: is HDMI audio on in the MEGA65's config?" } else { "" }),
+                s.peak == 0.0,
+            ),
+            Err(e) => (format!("recording failed: {e:#}"), true),
+        });
     }
 
     /// Pick up the newest frame. Call once per GUI frame.
@@ -120,6 +144,25 @@ impl LiveView {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
         }
         self.sync_audio(*on, *volume);
+        if let Some(r) = &self.recorder {
+            let secs = r.seconds();
+            let failed = r.error().or_else(|| r.finished().then(|| "stopped".to_string()));
+            if ui.button(RichText::new(format!("■ Stop recording  {}:{:04.1}", (secs / 60.0) as u32, secs % 60.0)).color(Color32::from_rgb(230, 90, 90))).on_hover_text(r.path.display().to_string()).clicked() || failed.is_some() {
+                self.stop_recording();
+            }
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+        } else if ui
+            .add_enabled(self.stream.is_some(), egui::Button::new("⏺ Record…"))
+            .on_hover_text("record the MEGA65's HDMI sound to a WAV file (16-bit stereo, the card's rate); works with 🔊 Sound on or off")
+            .clicked()
+        {
+            self.rec_note = None;
+            self.start_recording();
+        }
+        if let Some((n, err)) = &self.rec_note {
+            let t = RichText::new(n).small();
+            ui.label(if *err { t.color(Color32::from_rgb(230, 90, 90)) } else { t.weak() });
+        }
         if let Some(e) = &self.audio_error {
             ui.label(RichText::new(e).small().color(Color32::from_rgb(230, 90, 90)));
         }
